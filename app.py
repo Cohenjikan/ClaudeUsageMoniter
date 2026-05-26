@@ -12,6 +12,7 @@ import os
 import sys
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 from ctypes import wintypes
 from pathlib import Path
 
@@ -43,6 +44,15 @@ OK = "#3ddc97"          # green
 
 WINDOW_W, WINDOW_H = 340, 460
 TRAY_ICON_SIZE = 64     # internal render size; Windows downsamples to taskbar size
+
+# Sentinel "transparent color" for the strip's window — any pixel matching this
+# exact color becomes fully transparent via Toplevel's `-transparentcolor` attr.
+# Picked to be unlikely to ever appear in our text/outline (near-black but not
+# pure black, since pure black is used for outlines).
+TRANSPARENT_KEY = "#010101"
+# Outline color for strip text — drawn at 4 cardinal offsets to keep text
+# legible against any underlying desktop/taskbar color.
+TEXT_OUTLINE = "#000000"
 
 # Taskbar strip — a borderless always-on-top window pinned just above the Windows
 # taskbar, simulating the look of an embedded taskbar widget (without using the
@@ -376,63 +386,42 @@ class TaskbarStrip:
             if isinstance(cfg.get("x"), (int, float)) and isinstance(cfg.get("y"), (int, float))
             else None
         )
+        # Optional opaque dark backdrop — off by default (transparent looks
+        # cleaner over the taskbar). Useful when the strip is dragged onto a
+        # light desktop area where outlined text alone is hard to read.
+        self.show_background = bool(cfg.get("show_background", False))
 
         self.win = tk.Toplevel(parent_root)
         self.win.overrideredirect(True)         # no title bar / borders
         self.win.attributes("-topmost", True)   # above normal app windows
         self.win.attributes("-toolwindow", True)  # hide from Alt+Tab
-        self.win.configure(bg=BG)
+        # Transparent backdrop: any pixel matching TRANSPARENT_KEY becomes fully
+        # see-through on Windows. Both the Toplevel and the Canvas use this key
+        # color as their background, so only the drawn text + outline remain.
+        self.win.configure(bg=TRANSPARENT_KEY)
+        self.win.attributes("-transparentcolor", TRANSPARENT_KEY)
 
-        # Horizontal row of labels — separate widgets so each value can carry its own color.
-        row = tk.Frame(self.win, bg=BG)
-        row.pack(fill="both", expand=True, padx=10, pady=2)
+        # Strip width is dynamic — grown/shrunk to fit the rendered text each tick.
+        self.strip_w = STRIP_W
 
-        font_main = ("Segoe UI Semibold", 9)
-        font_dim = ("Segoe UI", 9)
+        # Font instances (not just tuples) so we can call .measure() during layout.
+        self.font_main = tkfont.Font(family="Segoe UI Semibold", size=9)
+        self.font_dim = tkfont.Font(family="Segoe UI", size=9)
 
-        # Pack from the SAME side the strip is pinned to, so content sits flush
-        # against the screen edge (left-pinned strip → text on the left).
-        pack_side = "left" if STRIP_SIDE == "left" else "right"
+        # Single Canvas replaces the old Frame+Labels arrangement. Canvas lets us
+        # draw outlined text manually (tkinter Labels can't do strokes) and
+        # combined with -transparentcolor produces a "floating text" look.
+        self.canvas = tk.Canvas(
+            self.win, bg=TRANSPARENT_KEY,
+            highlightthickness=0, borderwidth=0,
+            width=STRIP_W, height=STRIP_H,
+        )
+        self.canvas.pack(fill="both", expand=True)
 
-        def mk(text: str, fg: str, font: tuple) -> tk.Label:
-            lbl = tk.Label(row, text=text, bg=BG, fg=fg, font=font)
-            lbl.pack(side=pack_side)
-            return lbl
-
-        # Build in reading order; if pack_side is "right" tkinter naturally
-        # reverses the visual order so the read direction stays correct.
-        if pack_side == "left":
-            order = ["5h_cap", "5h_val", "sep1", "7d_cap", "7d_val", "sep2", "cost_cap", "cost_val"]
-        else:
-            order = ["cost_val", "cost_cap", "sep2", "7d_val", "7d_cap", "sep1", "5h_val", "5h_cap"]
-
-        slots: dict[str, tk.Label] = {}
-        for key in order:
-            if key == "5h_cap":
-                slots[key] = mk("5h ", FG_DIM, font_dim)
-            elif key == "5h_val":
-                slots[key] = mk("—", FG, font_main)
-            elif key == "7d_cap":
-                slots[key] = mk(" 7d ", FG_DIM, font_dim)
-            elif key == "7d_val":
-                slots[key] = mk("—", FG, font_main)
-            elif key == "cost_cap":
-                slots[key] = mk(" today ", FG_DIM, font_dim)
-            elif key == "cost_val":
-                slots[key] = mk("—", FG, font_main)
-            elif key in ("sep1", "sep2"):
-                slots[key] = mk("   ·   ", FG_DIM, font_dim)
-
-        self.five_lbl = slots["5h_val"]
-        self.seven_lbl = slots["7d_val"]
-        self.cost_lbl = slots["cost_val"]
-        self.cost_caption = slots["cost_cap"]
-
-        # Track all click-receiving widgets so we can change cursor/bg in drag mode.
-        self._all_widgets: list[tk.Widget] = [self.win, row, *slots.values()]
-        # Click bindings on the window, row container, and every label inside —
-        # otherwise clicks on a label fall through without firing.
-        for widget in self._all_widgets:
+        # Click bindings only need the canvas — outlined text covers most pixels,
+        # and clicks on the transparent gaps fall through to whatever's behind
+        # (usually the taskbar, where missing the strip is harmless).
+        for widget in (self.canvas, self.win):
             widget.bind("<Button-1>", self._on_btn1_press)
             widget.bind("<B1-Motion>", self._on_btn1_motion)
             widget.bind("<ButtonRelease-1>", self._on_btn1_release)
@@ -463,9 +452,9 @@ class TaskbarStrip:
                 if STRIP_SIDE == "left":
                     x = STRIP_SIDE_MARGIN
                 else:
-                    x = sw - STRIP_W - STRIP_SIDE_MARGIN
+                    x = sw - self.strip_w - STRIP_SIDE_MARGIN
                 y = get_taskbar_top_logical(sh) - STRIP_H - STRIP_GAP_FROM_TASKBAR
-            self.win.geometry(f"{STRIP_W}x{STRIP_H}+{x}+{y}")
+            self.win.geometry(f"{self.strip_w}x{STRIP_H}+{x}+{y}")
         self._force_topmost()
 
     def _force_topmost(self) -> None:
@@ -535,16 +524,21 @@ class TaskbarStrip:
         self._drag_anchor = None
 
     def set_drag_mode(self, enabled: bool) -> None:
-        """Toggle drag-to-reposition mode. Visual change: purple background +
-        4-way move cursor so the user knows clicking will drag, not open."""
+        """Toggle drag-to-reposition mode. Visual cues: 4-way move cursor on
+        hover, plus a thin ACCENT-colored outline rectangle drawn by _render."""
         self.drag_mode = enabled
-        new_bg = ACCENT if enabled else BG
-        new_cursor = "fleur" if enabled else ""
-        for w in self._all_widgets:
-            try:
-                w.configure(bg=new_bg, cursor=new_cursor)
-            except tk.TclError:
-                pass  # Some widget types don't accept all options — best-effort.
+        cursor = "fleur" if enabled else ""
+        try:
+            self.canvas.config(cursor=cursor)
+            self.win.config(cursor=cursor)
+        except tk.TclError:
+            pass
+        # Force a redraw so the outline rectangle (or its removal) shows up
+        # immediately rather than waiting for the next tick.
+        try:
+            self._render(self.orch.snapshot())
+        except Exception:
+            logging.getLogger(__name__).exception("strip redraw on drag toggle failed")
 
     def reset_position(self) -> None:
         """Clear the saved custom position and snap back to STRIP_SIDE defaults."""
@@ -555,6 +549,18 @@ class TaskbarStrip:
             cfg["strip"].pop("y", None)
         save_config(cfg)
         self._reposition()
+
+    def set_show_background(self, enabled: bool) -> None:
+        """Toggle the opaque dark backdrop behind the strip text. Persisted."""
+        self.show_background = enabled
+        cfg = load_config()
+        cfg.setdefault("strip", {})
+        cfg["strip"]["show_background"] = enabled
+        save_config(cfg)
+        try:
+            self._render(self.orch.snapshot())
+        except Exception:
+            logging.getLogger(__name__).exception("strip redraw on bg toggle failed")
 
     def _on_right_click(self, event) -> None:
         try:
@@ -571,16 +577,77 @@ class TaskbarStrip:
             self._reposition()
         self.win.after(1000, self._tick)
 
+    # Outline offsets — 4 cardinal directions, 1px out. (Diagonals add 4 more
+    # canvas items per glyph but visually almost no improvement; 4-way is the
+    # right cost/quality tradeoff.)
+    _OUTLINE_OFFSETS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+
+    def _draw_text(self, x: int, y: int, text: str, fg: str,
+                   font: tkfont.Font) -> int:
+        """Draw text with a 1px black outline at canvas pixel (x,y), anchored
+        west (left-of-baseline-center). Returns the advance width in pixels so
+        the caller can position the next piece."""
+        for dx, dy in self._OUTLINE_OFFSETS:
+            self.canvas.create_text(x + dx, y + dy, text=text, fill=TEXT_OUTLINE,
+                                    font=font, anchor="w")
+        self.canvas.create_text(x, y, text=text, fill=fg, font=font, anchor="w")
+        return font.measure(text)
+
     def _render(self, s) -> None:
         u = s.usage
         rpt = s.report
+
+        # Build the ordered list of (text, color, font) pieces. Caption pieces
+        # use FG_DIM; value pieces use the threshold-based color.
+        parts: list[tuple[str, str, tkfont.Font]] = []
         if u is not None:
-            self.five_lbl.config(text=f"{u.five_hour_pct:.0f}%",
-                                 fg=color_for_pct(u.five_hour_pct))
-            self.seven_lbl.config(text=f"{u.seven_day_pct:.0f}%",
-                                  fg=color_for_pct(u.seven_day_pct))
+            parts.append(("5h ", FG_DIM, self.font_dim))
+            parts.append((f"{u.five_hour_pct:.0f}%", color_for_pct(u.five_hour_pct), self.font_main))
+            parts.append(("   ·   ", FG_DIM, self.font_dim))
+            parts.append(("7d ", FG_DIM, self.font_dim))
+            parts.append((f"{u.seven_day_pct:.0f}%", color_for_pct(u.seven_day_pct), self.font_main))
         if rpt is not None:
-            self.cost_lbl.config(text=f"${rpt.today.cost_usd:,.2f}")
+            if u is not None:
+                parts.append(("   ·   ", FG_DIM, self.font_dim))
+            parts.append(("today ", FG_DIM, self.font_dim))
+            parts.append((f"${rpt.today.cost_usd:,.2f}", FG, self.font_main))
+        if not parts:
+            return  # nothing to draw yet (initial state before first data lands)
+
+        # Clear previous frame and re-draw from scratch.
+        self.canvas.delete("all")
+
+        # Total content width: sum of all advances. Padding leaves room for the
+        # 1px outline on both ends so the leftmost/rightmost glyph isn't clipped.
+        pad_x = 4
+        total_w = sum(font.measure(text) for text, _, font in parts) + pad_x * 2
+        y_center = STRIP_H // 2
+
+        # Optional opaque dark backdrop — drawn first so text + outlines layer on top.
+        if self.show_background:
+            self.canvas.create_rectangle(
+                0, 0, total_w, STRIP_H,
+                fill=BG, outline="")
+
+        # Drag-mode visual cue: thin ACCENT outline around the content area.
+        # Done before text so text draws over the corners.
+        if self.drag_mode:
+            self.canvas.create_rectangle(
+                0, 0, total_w - 1, STRIP_H - 1,
+                outline=ACCENT, width=1, fill="")
+
+        x = pad_x
+        for text, color, font in parts:
+            x += self._draw_text(x, y_center, text, color, font)
+
+        # Resize canvas + window to the actual content width. Only act if it
+        # changed materially — avoids redundant geometry calls on every tick
+        # when values are stable.
+        if abs(total_w - self.strip_w) >= 2:
+            self.strip_w = total_w
+            self.canvas.config(width=total_w, height=STRIP_H)
+            if not (self.drag_mode and self._drag_anchor is not None):
+                self._reposition()
 
 
 class TrayApp:
@@ -613,6 +680,11 @@ class TrayApp:
                 checked=lambda item: bool(self.strip and self.strip.visible),
             ))
             items.append(pystray.MenuItem(
+                "Strip: opaque background",
+                lambda _i, _item: self._on_strip_bg_toggle(),
+                checked=lambda item: bool(self.strip and self.strip.show_background),
+            ))
+            items.append(pystray.MenuItem(
                 "Move strip (drag with mouse)",
                 lambda _i, _item: self._on_strip_drag_toggle(),
                 checked=lambda item: bool(self.strip and self.strip.drag_mode),
@@ -641,6 +713,12 @@ class TrayApp:
             return
         new_val = not self.strip.drag_mode
         self.window.root.after(0, lambda: self.strip.set_drag_mode(new_val))
+
+    def _on_strip_bg_toggle(self) -> None:
+        if self.strip is None:
+            return
+        new_val = not self.strip.show_background
+        self.window.root.after(0, lambda: self.strip.set_show_background(new_val))
 
     def _on_strip_reset(self) -> None:
         if self.strip is None:
