@@ -111,8 +111,13 @@ rates or releases new model families.
 ## Caveats
 
 - **Rate limit**: `/api/oauth/usage` is aggressive (~5 req/token). We poll
-  every 6 min. A 429 surfaces in the strip footer as `usage_error` until the
-  next OK fetch. Token rotation on 429 is a future improvement.
+  every 6 min, well within budget.
+- **OAuth refresh**: tokens expire every 8h. The app auto-refreshes via
+  Anthropic's `/v1/oauth/token` endpoint and atomically writes the new
+  tokens back to `~/.claude/.credentials.json` — you never have to manually
+  `/login` under normal operation. Refresh attempts are rate-limited to one
+  per 5 min; on `invalid_grant` we back off for an hour and surface a
+  "run /login in Claude Code" message in the strip footer (very rare).
 - **Local cost is API-equivalent**, not what you actually pay (you pay flat
   Pro/Max subscription). Useful for comparing project value, not billing.
 - **Cache pricing**: `cache_creation_input_tokens` has two tiers (5-minute
