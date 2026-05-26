@@ -166,9 +166,18 @@ def iter_turns(root: Path = PROJECTS_ROOT) -> Iterable[TurnCost]:
 
 
 def build_report(root: Path = PROJECTS_ROOT, now: datetime | None = None) -> UsageReport:
-    """Aggregate all turns into the structured report the UI consumes."""
+    """Aggregate all turns into the structured report the UI consumes.
+
+    Day / month boundaries follow the user's LOCAL timezone, not UTC — the
+    user thinks in local-calendar terms ("today's spend"), not in UTC days.
+    JSONL timestamps come in as UTC-aware datetimes; Python compares aware
+    datetimes by absolute moment, so the cross-tz comparison is correct.
+    """
     if now is None:
-        now = datetime.now(timezone.utc)
+        # `astimezone()` with no argument attaches the system's local tz to the
+        # current moment, giving us a local-aware datetime we can floor to
+        # local midnight / month-start.
+        now = datetime.now().astimezone()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
