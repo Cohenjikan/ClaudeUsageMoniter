@@ -16,7 +16,9 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from jsonl_costs import UsageReport, build_report
-from usage_api import UsageSnapshot, fetch_usage, load_oauth_creds
+from usage_api import (
+    OAuthCreds, UsageSnapshot, fetch_usage, load_oauth_creds, refresh_and_save,
+)
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +33,14 @@ JSONL_INTERVAL_SEC = 30
 # only way out is a fresh token. Wait 15 minutes before trying again — gives
 # Claude Code plenty of time to refresh the token through normal use.
 RATE_LIMIT_BACKOFF_SEC = 900
+# Don't try OAuth refresh more often than this — prevents thrashing Anthropic
+# if something is wrong (e.g. user is offline) and limits any potential
+# conflict with Claude Code's own internal refresh cycle.
+MIN_REFRESH_INTERVAL_SEC = 300
+# If refresh comes back invalid_grant (refresh_token rotated out from under us),
+# back off long — the only fix is the user running /login in Claude Code, and
+# we don't want to keep poking Anthropic in the meantime.
+INVALID_GRANT_BACKOFF_SEC = 3600
 
 
 @dataclass
@@ -47,6 +57,9 @@ class AppState:
     # or detect the token is expired, to avoid burning more of the per-token
     # rate-limit budget while we wait for Claude Code to refresh the token.
     api_backoff_until: float = 0.0
+    # Last time we attempted an OAuth refresh — used to rate-limit refresh attempts
+    # to one per MIN_REFRESH_INTERVAL_SEC.
+    last_refresh_attempt: float = 0.0
     # Last alert state per threshold key — used to fire each threshold only once per crossing.
     alerted_5h: set[int] = field(default_factory=set)
     alerted_7d: set[int] = field(default_factory=set)
@@ -105,6 +118,7 @@ class Orchestrator:
                 last_api_fetch=self.state.last_api_fetch,
                 last_jsonl_parse=self.state.last_jsonl_parse,
                 api_backoff_until=self.state.api_backoff_until,
+                last_refresh_attempt=self.state.last_refresh_attempt,
                 alerted_5h=set(self.state.alerted_5h),
                 alerted_7d=set(self.state.alerted_7d),
             )
@@ -124,34 +138,7 @@ class Orchestrator:
                 continue
 
             try:
-                creds = load_oauth_creds()  # re-read every cycle: pick up Claude Code refreshes
-                if creds.is_expired():
-                    # Don't fire the request — it'd 401 and waste rate-limit budget.
-                    # Claude Code refreshes its own token on next use, and we'll see
-                    # the new token on the next cycle's load_oauth_creds().
-                    self._record_api_error(
-                        "Token expired — open Claude Code to refresh")
-                else:
-                    snap = fetch_usage(creds.access_token)
-                    with self._lock:
-                        self.state.usage = snap
-                        self.state.usage_error = ""
-                        self.state.last_api_fetch = time.time()
-                    self._check_thresholds(snap)
-                    self._on_change()
-            except urllib.error.HTTPError as e:
-                msg = f"HTTP {e.code}: {e.reason}"
-                if e.code == 429:
-                    # Hit the per-token rate limit. Set a long backoff so we
-                    # stop poking and let the token rotate via Claude Code.
-                    with self._lock:
-                        self.state.api_backoff_until = time.time() + RATE_LIMIT_BACKOFF_SEC
-                    msg += f" (backing off {RATE_LIMIT_BACKOFF_SEC // 60} min)"
-                elif e.code == 401:
-                    # Token rejected (likely expired/revoked between our check
-                    # and the request). Same recovery as expired-locally.
-                    msg += " — token rejected, waiting for Claude Code refresh"
-                self._record_api_error(msg)
+                self._do_fetch_cycle()
             except urllib.error.URLError as e:
                 self._record_api_error(f"network: {e.reason}")
             except (FileNotFoundError, ValueError) as e:
@@ -161,6 +148,98 @@ class Orchestrator:
 
             self._api_wake.wait(timeout=API_INTERVAL_SEC)
             self._api_wake.clear()
+
+    def _do_fetch_cycle(self) -> None:
+        """One full API fetch cycle: ensure token is valid (refresh if needed),
+        call the usage endpoint, handle errors (with one retry after refresh
+        on 401), record state."""
+        creds = load_oauth_creds()
+        if creds.is_expired():
+            creds = self._try_refresh()
+            if creds is None:
+                return  # error already recorded; backoff already set if applicable
+
+        # First attempt
+        try:
+            snap = fetch_usage(creds.access_token)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                # Token rejected even though local expiresAt looked OK — try one
+                # refresh + retry. Anthropic occasionally invalidates tokens before
+                # their stated expiry (see anthropics/claude-code#54443).
+                log.info("API returned 401; attempting refresh + retry")
+                creds = self._try_refresh()
+                if creds is None:
+                    return
+                try:
+                    snap = fetch_usage(creds.access_token)
+                except urllib.error.HTTPError as e2:
+                    self._handle_api_http_error(e2)
+                    return
+            else:
+                self._handle_api_http_error(e)
+                return
+
+        # Success path
+        with self._lock:
+            self.state.usage = snap
+            self.state.usage_error = ""
+            self.state.last_api_fetch = time.time()
+        self._check_thresholds(snap)
+        self._on_change()
+
+    def _try_refresh(self) -> OAuthCreds | None:
+        """Attempt OAuth refresh-and-save with rate-limiting. Returns new creds
+        on success, None on failure (after recording an error/backoff)."""
+        now = time.time()
+        cooldown_left = MIN_REFRESH_INTERVAL_SEC - (now - self.state.last_refresh_attempt)
+        if cooldown_left > 0:
+            self._record_api_error(
+                f"Token expired, refresh on cooldown ({int(cooldown_left)}s)")
+            return None
+        with self._lock:
+            self.state.last_refresh_attempt = now
+
+        try:
+            new_creds = refresh_and_save()
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            if e.code == 400 and "invalid_grant" in body:
+                # Disk's refresh_token is stale. Likely Claude Code refreshed
+                # in-memory at some point and our save-back chain is broken,
+                # OR our previous refresh succeeded but we crashed before
+                # writing back. Either way, only /login fixes it — long backoff.
+                with self._lock:
+                    self.state.api_backoff_until = time.time() + INVALID_GRANT_BACKOFF_SEC
+                self._record_api_error(
+                    "Refresh rejected — run /login in Claude Code")
+            else:
+                self._record_api_error(
+                    f"Refresh HTTP {e.code}: {body[:60]}")
+            return None
+        except urllib.error.URLError as e:
+            self._record_api_error(f"Refresh network: {e.reason}")
+            return None
+        except Exception as e:  # noqa: BLE001
+            self._record_api_error(f"Refresh failed: {type(e).__name__}: {e}")
+            return None
+
+        log.info("OAuth token refreshed; new expiry %s",
+                 time.strftime("%H:%M:%S", time.localtime(new_creds.expires_at_unix)))
+        return new_creds
+
+    def _handle_api_http_error(self, e: urllib.error.HTTPError) -> None:
+        """Record a usage-endpoint HTTP error and set backoff if appropriate."""
+        msg = f"HTTP {e.code}: {e.reason}"
+        if e.code == 429:
+            with self._lock:
+                self.state.api_backoff_until = time.time() + RATE_LIMIT_BACKOFF_SEC
+            msg += f" (backing off {RATE_LIMIT_BACKOFF_SEC // 60} min)"
+        self._record_api_error(msg)
 
     def _jsonl_loop(self) -> None:
         while not self._stop.is_set():

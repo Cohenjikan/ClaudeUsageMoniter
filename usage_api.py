@@ -16,6 +16,13 @@ from typing import Any
 # and by tools like CodeZeno's Claude-Code-Usage-Monitor and Maciek-roboblog's monitor).
 USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
 
+# OAuth token refresh endpoint + Claude Code's OAuth client_id (matches what
+# `claude /login` uses). Refresh tokens rotate on every use, so any caller of
+# `refresh_oauth` MUST persist the returned refresh_token immediately —
+# otherwise the next refresh will hit invalid_grant and force a re-login.
+OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+CLAUDE_CODE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
 # User-Agent must look like Claude Code or the endpoint hits a much tighter rate-limit bucket.
 # See: github.com/anthropics/claude-code/issues/31021
 DEFAULT_UA = "claude-code/2.0.0"
@@ -103,6 +110,80 @@ def load_oauth_creds(creds_path: Path = CREDENTIALS_PATH) -> OAuthCreds:
         refresh_token=oauth.get("refreshToken") or "",
         expires_at_unix=(oauth.get("expiresAt") or 0) / 1000,
     )
+
+
+def refresh_oauth(refresh_token: str, *, user_agent: str = DEFAULT_UA) -> dict[str, Any]:
+    """POST the refresh_token to Anthropic's OAuth endpoint and return the raw
+    response dict — keys include `access_token`, `refresh_token`, `expires_in`,
+    `scope`, `token_uuid`, etc.
+
+    NOTE: refresh tokens **rotate** on every successful use. The previous
+    refresh_token is invalidated server-side as soon as this call returns
+    success. The caller MUST persist the new refresh_token immediately or any
+    future refresh will fail with HTTP 400 `invalid_grant`.
+
+    Raises urllib.error.HTTPError on Anthropic-side rejection (most commonly
+    400 invalid_grant if the supplied refresh_token was already consumed).
+    """
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLAUDE_CODE_CLIENT_ID,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        OAUTH_TOKEN_URL, data=body, method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": user_agent,
+            "anthropic-beta": "oauth-2025-04-20",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def save_oauth_creds(new_access: str, new_refresh: str, expires_in_sec: int,
+                     creds_path: Path = CREDENTIALS_PATH) -> None:
+    """Atomically write new OAuth tokens back to credentials.json, preserving
+    every other field (organization id, account info, scopes — anything Claude
+    Code put there besides accessToken/refreshToken/expiresAt).
+
+    Atomicity: writes to a sibling .json.tmp first, then `Path.replace()` —
+    a crash mid-write therefore can never leave a half-written file that
+    would force the user to /login again.
+    """
+    if creds_path.exists():
+        with open(creds_path, encoding="utf-8") as f:
+            creds = json.load(f)
+    else:
+        creds = {}
+    oauth = creds.setdefault("claudeAiOauth", {})
+    oauth["accessToken"] = new_access
+    oauth["refreshToken"] = new_refresh
+    oauth["expiresAt"] = int((time.time() + expires_in_sec) * 1000)
+
+    tmp = creds_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(creds, indent=2), encoding="utf-8")
+    tmp.replace(creds_path)
+
+
+def refresh_and_save(creds_path: Path = CREDENTIALS_PATH) -> OAuthCreds:
+    """Read disk → refresh via OAuth endpoint → write disk → return new creds.
+
+    The save-back is non-negotiable here precisely because refresh_token
+    rotation means a refresh-without-save burns the only working token.
+    """
+    current = load_oauth_creds(creds_path)
+    if not current.refresh_token:
+        raise ValueError("No refresh_token available; please /login in Claude Code")
+    resp = refresh_oauth(current.refresh_token)
+    save_oauth_creds(
+        new_access=resp["access_token"],
+        new_refresh=resp["refresh_token"],
+        expires_in_sec=int(resp.get("expires_in", 28800)),
+        creds_path=creds_path,
+    )
+    return load_oauth_creds(creds_path)
 
 
 def fetch_usage(token: str | None = None, *, user_agent: str = DEFAULT_UA) -> UsageSnapshot:
