@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from jsonl_costs import UsageReport, build_report
-from usage_api import UsageSnapshot, fetch_usage, load_oauth_token
+from usage_api import UsageSnapshot, fetch_usage, load_oauth_creds
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +26,11 @@ log = logging.getLogger(__name__)
 # when we get 429ed. 360s = 6 min is what CodeZeno uses by default.
 API_INTERVAL_SEC = 360
 JSONL_INTERVAL_SEC = 30
+# Backoff applied after we get rate-limited (HTTP 429). The /api/oauth/usage
+# endpoint allows roughly 5 requests per token lifetime; once we trip it, the
+# only way out is a fresh token. Wait 15 minutes before trying again — gives
+# Claude Code plenty of time to refresh the token through normal use.
+RATE_LIMIT_BACKOFF_SEC = 900
 
 
 @dataclass
@@ -38,6 +43,10 @@ class AppState:
     report_error: str = ""
     last_api_fetch: float = 0.0
     last_jsonl_parse: float = 0.0
+    # Don't call the API again until this Unix timestamp. Set when we hit a 429
+    # or detect the token is expired, to avoid burning more of the per-token
+    # rate-limit budget while we wait for Claude Code to refresh the token.
+    api_backoff_until: float = 0.0
     # Last alert state per threshold key — used to fire each threshold only once per crossing.
     alerted_5h: set[int] = field(default_factory=set)
     alerted_7d: set[int] = field(default_factory=set)
@@ -95,6 +104,7 @@ class Orchestrator:
                 report_error=self.state.report_error,
                 last_api_fetch=self.state.last_api_fetch,
                 last_jsonl_parse=self.state.last_jsonl_parse,
+                api_backoff_until=self.state.api_backoff_until,
                 alerted_5h=set(self.state.alerted_5h),
                 alerted_7d=set(self.state.alerted_7d),
             )
@@ -103,24 +113,52 @@ class Orchestrator:
 
     def _api_loop(self) -> None:
         while not self._stop.is_set():
+            now = time.time()
+            backoff_left = self.state.api_backoff_until - now
+            if backoff_left > 0:
+                # In backoff (after a 429 or while token is expired). Sleep
+                # without burning more budget, but respond to manual wake-ups
+                # by re-evaluating at the next iteration top.
+                self._api_wake.wait(timeout=min(backoff_left, API_INTERVAL_SEC))
+                self._api_wake.clear()
+                continue
+
             try:
-                token, _ = load_oauth_token()
-                snap = fetch_usage(token)
-                with self._lock:
-                    self.state.usage = snap
-                    self.state.usage_error = ""
-                    self.state.last_api_fetch = time.time()
-                self._check_thresholds(snap)
-                self._on_change()
+                creds = load_oauth_creds()  # re-read every cycle: pick up Claude Code refreshes
+                if creds.is_expired():
+                    # Don't fire the request — it'd 401 and waste rate-limit budget.
+                    # Claude Code refreshes its own token on next use, and we'll see
+                    # the new token on the next cycle's load_oauth_creds().
+                    self._record_api_error(
+                        "Token expired — open Claude Code to refresh")
+                else:
+                    snap = fetch_usage(creds.access_token)
+                    with self._lock:
+                        self.state.usage = snap
+                        self.state.usage_error = ""
+                        self.state.last_api_fetch = time.time()
+                    self._check_thresholds(snap)
+                    self._on_change()
             except urllib.error.HTTPError as e:
-                self._record_api_error(f"HTTP {e.code}: {e.reason}")
+                msg = f"HTTP {e.code}: {e.reason}"
+                if e.code == 429:
+                    # Hit the per-token rate limit. Set a long backoff so we
+                    # stop poking and let the token rotate via Claude Code.
+                    with self._lock:
+                        self.state.api_backoff_until = time.time() + RATE_LIMIT_BACKOFF_SEC
+                    msg += f" (backing off {RATE_LIMIT_BACKOFF_SEC // 60} min)"
+                elif e.code == 401:
+                    # Token rejected (likely expired/revoked between our check
+                    # and the request). Same recovery as expired-locally.
+                    msg += " — token rejected, waiting for Claude Code refresh"
+                self._record_api_error(msg)
             except urllib.error.URLError as e:
                 self._record_api_error(f"network: {e.reason}")
             except (FileNotFoundError, ValueError) as e:
                 self._record_api_error(str(e))
             except Exception as e:  # noqa: BLE001 — last-resort safety
                 self._record_api_error(f"{type(e).__name__}: {e}")
-            # Wait for either the interval or a manual wake.
+
             self._api_wake.wait(timeout=API_INTERVAL_SEC)
             self._api_wake.clear()
 

@@ -5,7 +5,6 @@ This is the data-layer module — pure functions, no UI.
 from __future__ import annotations
 
 import json
-import os
 import time
 import urllib.error
 import urllib.request
@@ -61,8 +60,28 @@ def _minutes_until_iso(iso_ts: str) -> int:
         return 0
 
 
+@dataclass
+class OAuthCreds:
+    """Claude Code's stored OAuth state, with a convenience expiry check."""
+    access_token: str
+    refresh_token: str
+    expires_at_unix: float    # Unix seconds (not ms)
+
+    def is_expired(self, buffer_sec: float = 30) -> bool:
+        """True if the access token is past expiry, including a small safety buffer
+        so we don't fire a request that will arrive after expiry."""
+        return time.time() >= self.expires_at_unix - buffer_sec
+
+
 def load_oauth_token(creds_path: Path = CREDENTIALS_PATH) -> tuple[str, int]:
-    """Read Claude Code's stored access token. Returns (token, expires_at_unix_ms).
+    """Back-compat wrapper — returns (access_token, expires_at_unix_ms)."""
+    c = load_oauth_creds(creds_path)
+    return c.access_token, int(c.expires_at_unix * 1000)
+
+
+def load_oauth_creds(creds_path: Path = CREDENTIALS_PATH) -> OAuthCreds:
+    """Read Claude Code's stored OAuth state — re-reads from disk every call so
+    we automatically pick up tokens refreshed by Claude Code itself.
 
     Raises FileNotFoundError if Claude Code has never been logged in.
     """
@@ -74,13 +93,16 @@ def load_oauth_token(creds_path: Path = CREDENTIALS_PATH) -> tuple[str, int]:
     with open(creds_path, encoding="utf-8") as f:
         creds = json.load(f)
     oauth = creds.get("claudeAiOauth") or {}
-    token = oauth.get("accessToken")
-    expires_at = oauth.get("expiresAt", 0)
-    if not token:
+    access = oauth.get("accessToken") or ""
+    if not access:
         raise ValueError(
             f"No accessToken in {creds_path}. Try logging into Claude Code again."
         )
-    return token, expires_at
+    return OAuthCreds(
+        access_token=access,
+        refresh_token=oauth.get("refreshToken") or "",
+        expires_at_unix=(oauth.get("expiresAt") or 0) / 1000,
+    )
 
 
 def fetch_usage(token: str | None = None, *, user_agent: str = DEFAULT_UA) -> UsageSnapshot:
