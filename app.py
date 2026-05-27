@@ -51,6 +51,7 @@ LANGUAGES: dict[str, dict[str, str]] = {
         "mode_1": "Compact (quota only)",
         "mode_2": "+ Time remaining",
         "mode_3": "+ Time-remaining %",
+        "mode_4": "+ Time-elapsed %",
         "language": "Language",
         "quit": "Quit",
         # Strip labels
@@ -71,6 +72,7 @@ LANGUAGES: dict[str, dict[str, str]] = {
         "mode_1": "简洁 (仅额度)",
         "mode_2": "+ 剩余时间",
         "mode_3": "+ 剩余时间百分比",
+        "mode_4": "+ 已用时间百分比",
         "language": "语言",
         "quit": "退出",
         "5h": "5h",
@@ -465,10 +467,14 @@ class TaskbarStrip:
         # cleaner over the taskbar). Useful when the strip is dragged onto a
         # light desktop area where outlined text alone is hard to read.
         self.show_background = bool(cfg.get("show_background", False))
-        # Display mode: 1=quota only, 2=quota + time remaining, 3=quota + time-remaining %.
+        # Display mode (see _append_quota_parts for the layout per mode):
+        #   1 = compact: just quota%
+        #   2 = quota% + (remaining time as h/m/d string)
+        #   3 = quota% / remaining-time-as-% (counts DOWN as window expires)
+        #   4 = quota% / elapsed-time-as-% (counts UP — same direction as quota%)
         # Cap to the valid range so a hand-edited config can't put us in a weird state.
         raw_mode = cfg.get("display_mode", 1)
-        self.display_mode = raw_mode if raw_mode in (1, 2, 3) else 1
+        self.display_mode = raw_mode if raw_mode in (1, 2, 3, 4) else 1
 
         self.win = tk.Toplevel(parent_root)
         self.win.overrideredirect(True)         # no title bar / borders
@@ -642,8 +648,8 @@ class TaskbarStrip:
             logging.getLogger(__name__).exception("strip redraw on bg toggle failed")
 
     def set_display_mode(self, mode: int) -> None:
-        """Switch display_mode (1/2/3) and persist. Triggers an immediate redraw."""
-        if mode not in (1, 2, 3):
+        """Switch display_mode (1/2/3/4) and persist. Triggers an immediate redraw."""
+        if mode not in (1, 2, 3, 4):
             return
         self.display_mode = mode
         cfg = load_config()
@@ -702,14 +708,27 @@ class TaskbarStrip:
             # Mode 2: quota% (time remaining)
             parts.append((f"{quota_pct:.0f}%", quota_color, self.font_main))
             parts.append((f" ({fmt_minutes(mins_remaining)})", FG_DIM, self.font_dim))
-        else:  # mode 3
+        elif self.display_mode == 3:
             # Mode 3: quota% / time-remaining-as-pct-of-total-window
+            # (second number counts DOWN as window approaches reset)
             time_pct = 0
             if total_window_min > 0:
                 time_pct = max(0, min(100, int(mins_remaining / total_window_min * 100)))
             parts.append((f"{quota_pct:.0f}%", quota_color, self.font_main))
             parts.append(("/", FG_DIM, self.font_dim))
             parts.append((f"{time_pct}%", FG, self.font_main))
+        else:  # mode 4
+            # Mode 4: quota% / elapsed-time-as-pct-of-total-window
+            # (second number counts UP — same direction as quota%, so you can
+            # eyeball "am I burning faster than time is passing": elapsed% <
+            # quota% means yes.)
+            elapsed_pct = 0
+            if total_window_min > 0:
+                mins_elapsed = total_window_min - mins_remaining
+                elapsed_pct = max(0, min(100, int(mins_elapsed / total_window_min * 100)))
+            parts.append((f"{quota_pct:.0f}%", quota_color, self.font_main))
+            parts.append(("/", FG_DIM, self.font_dim))
+            parts.append((f"{elapsed_pct}%", FG, self.font_main))
 
     def _render(self, s) -> None:
         u = s.usage
@@ -843,7 +862,10 @@ class TrayApp:
                 checked=lambda _it: bool(self.strip and self.strip.display_mode == mode),
                 radio=True,
             )
-        return pystray.Menu(make(1, "mode_1"), make(2, "mode_2"), make(3, "mode_3"))
+        return pystray.Menu(
+            make(1, "mode_1"), make(2, "mode_2"),
+            make(3, "mode_3"), make(4, "mode_4"),
+        )
 
     def _build_language_menu(self) -> pystray.Menu:
         """Radio-style picker for UI language. Currently English + 中文."""
