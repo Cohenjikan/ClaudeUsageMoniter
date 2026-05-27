@@ -521,8 +521,43 @@ class TaskbarStrip:
         self._menu.add_separator()
         self._menu.add_command(label="Hide strip", command=self.hide)
 
+        # Validate saved drag position before first paint: if it points into
+        # the taskbar area (where Win11's TOPMOST taskbar would hide us — we
+        # can't beat its z-order with a normal app window) or off-screen,
+        # snap it to a visible spot and re-save. This migrates positions
+        # left over from an earlier build that tolerated taskbar overlap.
+        self._validate_custom_pos()
+
         self._reposition()
         self._tick()
+
+    def _validate_custom_pos(self) -> None:
+        if self._custom_pos is None:
+            return
+        try:
+            sw = self.win.winfo_screenwidth()
+            sh = self.win.winfo_screenheight()
+            tb_top = get_taskbar_top_logical(sh)
+        except tk.TclError:
+            return
+        x, y = self._custom_pos
+        new_x, new_y = x, y
+        if y + STRIP_H > tb_top:                 # would overlap taskbar
+            new_y = tb_top - STRIP_H - STRIP_GAP_FROM_TASKBAR
+        new_x = max(0, min(new_x, sw - 60))      # at least 60 px visible
+        new_y = max(0, new_y)
+        if (new_x, new_y) == (x, y):
+            return
+        log = logging.getLogger(__name__)
+        log.info("strip: migrating saved position (%d,%d) -> (%d,%d) "
+                 "(was overlapping taskbar or off-screen)",
+                 x, y, new_x, new_y)
+        self._custom_pos = (new_x, new_y)
+        cfg = load_config()
+        cfg.setdefault("strip", {})
+        cfg["strip"]["x"] = new_x
+        cfg["strip"]["y"] = new_y
+        save_config(cfg)
 
     def _reposition(self) -> None:
         # Skip geometry update during a drag (mouse drives it); always still
@@ -588,12 +623,19 @@ class TaskbarStrip:
         mx0, my0, wx0, wy0 = self._drag_anchor
         new_x = wx0 + (event.x_root - mx0)
         new_y = wy0 + (event.y_root - my0)
-        # Clamp so at least ~60px of the strip stays on the primary monitor —
-        # otherwise a wild drag can leave it un-grabbable off-screen.
+        # Clamp X so at least ~60px stays on the primary monitor — otherwise
+        # a wild drag can leave the strip un-grabbable off-screen.
         sw = self.win.winfo_screenwidth()
         sh = self.win.winfo_screenheight()
         new_x = max(-STRIP_W + 60, min(new_x, sw - 60))
-        new_y = max(0, min(new_y, sh - 10))
+        # Clamp Y to STOP at the top of the Windows taskbar. We can't reliably
+        # render above the taskbar with a normal HWND_TOPMOST window — the
+        # taskbar is also HWND_TOPMOST and the simple `lift+topmost` bump trick
+        # we use doesn't outrank it. So we prevent the user from dragging into
+        # a zone where the strip would silently disappear.
+        tb_top = get_taskbar_top_logical(sh)
+        max_y = tb_top - STRIP_H
+        new_y = max(0, min(new_y, max_y))
         self.win.geometry(f"+{new_x}+{new_y}")
 
     def _on_btn1_release(self, _event) -> None:
