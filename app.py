@@ -126,12 +126,16 @@ TEXT_OUTLINE = "#000000"
 STRIP_W, STRIP_H = 360, 26
 STRIP_SIDE = "left"         # "left" or "right" — which side of the screen to pin to
 STRIP_SIDE_MARGIN = 12      # gap from the chosen screen edge
-# NOTE: pinning the strip OVER the taskbar (sh - STRIP_H) is fundamentally
-# fragile on Win11 — the shell actively hides topmost windows that overlap the
-# taskbar when Settings / Notification Center / Quick Settings flyouts open,
-# and no amount of SetWindowPos / ShowWindow / deiconify in user-space resists
-# this reliably. Keep the strip JUST ABOVE the taskbar instead — that's where
-# every actually-stable taskbar-widget tool (Rainmeter skins, etc) lives.
+# Pinning the strip OVER the Windows taskbar is fully supported — drag it
+# anywhere on screen and it'll stick. Z-order is inherently contentious there
+# (the taskbar is HWND_TOPMOST too), so we defend with three mechanisms:
+#   (1) every tick (1s) we re-bump topmost via the tkinter "off→on + lift"
+#       trick, plus a direct SetWindowPos(HWND_TOPMOST) for stubborn cases
+#   (2) a burst of bumps in the first ~10 seconds after launch — autostart
+#       races with the shell often push us behind the taskbar at boot
+#   (3) WindowFromPoint sampling detects when something IS in front of us
+#       (Quick Settings, Notification Center, the taskbar itself after an
+#       autostart race) and escalates the bump immediately
 STRIP_GAP_FROM_TASKBAR = 0  # gap between strip bottom and taskbar top
 
 
@@ -168,8 +172,41 @@ def set_app_language(lang: str) -> None:
     save_config(cfg)
 
 
-# ---- Win32 helpers for taskbar position detection ----
+# ---- Win32 helpers for taskbar position detection + z-order recovery ----
 _SPI_GETWORKAREA = 0x0030
+# GetAncestor(hwnd, GA_ROOT) → top-level root of the given window. Used to
+# normalize WindowFromPoint hits to a single HWND we can compare against ours.
+_GA_ROOT = 2
+# SetWindowPos special-z-order constants — HWND_TOPMOST keeps the window above
+# all non-topmost windows; pair with the SWP_* flags below to update z-order
+# only (no move/resize, no activate, but make sure we're shown).
+_HWND_TOPMOST = -1
+_SWP_NOSIZE = 0x0001
+_SWP_NOMOVE = 0x0002
+_SWP_NOACTIVATE = 0x0010
+_SWP_SHOWWINDOW = 0x0040
+
+# Declare argtypes/restype for every Win32 call we make below. Without this,
+# ctypes defaults to c_int (32-bit) on both sides — on 64-bit Windows that
+# truncates HWNDs to 32 bits, which silently breaks the `WindowFromPoint
+# result == our_hwnd` equality check (different upper-32 bits) AND can pass
+# a wrong sign-extended HWND_TOPMOST (-1) to SetWindowPos. Explicit typing
+# costs nothing and avoids a class of impossible-to-debug heisenbugs.
+_user32 = ctypes.windll.user32
+_user32.WindowFromPoint.argtypes = [wintypes.POINT]
+_user32.WindowFromPoint.restype = wintypes.HWND
+_user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+_user32.GetAncestor.restype = wintypes.HWND
+_user32.SetWindowPos.argtypes = [
+    wintypes.HWND, wintypes.HWND,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    wintypes.UINT,
+]
+_user32.SetWindowPos.restype = wintypes.BOOL
+_user32.SystemParametersInfoW.argtypes = [
+    wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT,
+]
+_user32.SystemParametersInfoW.restype = wintypes.BOOL
 
 
 def get_taskbar_top_logical(fallback_screen_h: int) -> int:
@@ -188,7 +225,7 @@ def get_taskbar_top_logical(fallback_screen_h: int) -> int:
     Falls back to (screen_h - 48) if the SPI call fails.
     """
     rect = wintypes.RECT()
-    ok = ctypes.windll.user32.SystemParametersInfoW(
+    ok = _user32.SystemParametersInfoW(
         _SPI_GETWORKAREA, 0, ctypes.byref(rect), 0)
     if not ok:
         return fallback_screen_h - 48
@@ -521,36 +558,48 @@ class TaskbarStrip:
         self._menu.add_separator()
         self._menu.add_command(label="Hide strip", command=self.hide)
 
-        # Validate saved drag position before first paint: if it points into
-        # the taskbar area (where Win11's TOPMOST taskbar would hide us — we
-        # can't beat its z-order with a normal app window) or off-screen,
-        # snap it to a visible spot and re-save. This migrates positions
-        # left over from an earlier build that tolerated taskbar overlap.
+        # Validate saved drag position before first paint: only catches
+        # *truly off-screen* positions (previous run was on a now-disconnected
+        # monitor, or screen resolution shrank). Taskbar overlap is fine —
+        # the _is_covered() + force-topmost burst handles z-order contention.
         self._validate_custom_pos()
 
         self._reposition()
         self._tick()
+        # Startup burst: schedule extra force-topmost calls during the first
+        # ~10 seconds. Counters the autostart race where the Win11 shell
+        # finishes initializing after us and shoves the taskbar's HWND_TOPMOST
+        # window above ours. Once the system is settled, the per-tick bump +
+        # _is_covered() escalation handles ongoing z-order contention.
+        for delay_ms in (300, 700, 1500, 3000, 6000, 10000):
+            self.win.after(delay_ms, self._startup_bump)
 
     def _validate_custom_pos(self) -> None:
+        """Snap a saved position back on-screen if it's fully off-screen (e.g.
+        the previous run was on a now-disconnected monitor).
+
+        Does NOT migrate off taskbar overlap — the user can intentionally pin
+        the strip on top of the taskbar; _is_covered()-driven force-topmost
+        keeps it visible there. Earlier builds aggressively moved positions
+        above the taskbar, which we've now reverted because it broke a
+        deliberate use case.
+        """
         if self._custom_pos is None:
             return
         try:
             sw = self.win.winfo_screenwidth()
             sh = self.win.winfo_screenheight()
-            tb_top = get_taskbar_top_logical(sh)
         except tk.TclError:
             return
         x, y = self._custom_pos
-        new_x, new_y = x, y
-        if y + STRIP_H > tb_top:                 # would overlap taskbar
-            new_y = tb_top - STRIP_H - STRIP_GAP_FROM_TASKBAR
-        new_x = max(0, min(new_x, sw - 60))      # at least 60 px visible
-        new_y = max(0, new_y)
+        # Keep at least ~60 px visible horizontally, and don't fall off the
+        # bottom of the screen entirely. Both bounds permit taskbar overlap.
+        new_x = max(0, min(x, sw - 60))
+        new_y = max(0, min(y, sh - STRIP_H))
         if (new_x, new_y) == (x, y):
             return
         log = logging.getLogger(__name__)
-        log.info("strip: migrating saved position (%d,%d) -> (%d,%d) "
-                 "(was overlapping taskbar or off-screen)",
+        log.info("strip: rescuing off-screen saved position (%d,%d) -> (%d,%d)",
                  x, y, new_x, new_y)
         self._custom_pos = (new_x, new_y)
         cfg = load_config()
@@ -592,6 +641,83 @@ class TaskbarStrip:
         except tk.TclError:
             pass
 
+    def _force_topmost_winapi(self) -> None:
+        """Backup to the tkinter bump trick: call SetWindowPos directly with
+        HWND_TOPMOST. Sometimes wins z-order fights the tkinter -topmost
+        toggle alone doesn't — notably right after the Win11 shell finishes
+        initializing on a boot-time autostart and re-asserts the taskbar's
+        topmost rank.
+
+        Cheap (one kernel call), safe to invoke even when we're already
+        on top, so we call it speculatively in the startup burst and
+        defensively whenever _is_covered() returns True.
+        """
+        if not self.visible:
+            return
+        try:
+            hwnd = int(self.win.wm_frame(), 16)
+        except (ValueError, tk.TclError):
+            return
+        flags = _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE | _SWP_SHOWWINDOW
+        try:
+            _user32.SetWindowPos(hwnd, _HWND_TOPMOST, 0, 0, 0, 0, flags)
+        except OSError:
+            pass
+
+    def _is_covered(self) -> bool:
+        """Detect whether another top-level window is in front of us.
+
+        Strategy: sample 5 horizontally-spread points across our strip and ask
+        WindowFromPoint who's on top at each. Walk each hit up to its root via
+        GetAncestor(GA_ROOT), then compare against our own HWND.
+
+        Why multi-point sampling: our backdrop uses `-transparentcolor`, so
+        any pixel matching TRANSPARENT_KEY is click-through — WindowFromPoint
+        at such a pixel returns whatever's behind us (a false negative for
+        "are we visible"). Real text glyphs ARE opaque though, so as long as
+        any sampled point lands on a glyph or its outline, we get a true hit.
+        5 samples at 5%/25%/50%/75%/95% gives plenty of coverage for any
+        non-trivial text layout.
+
+        Returns True only if *no* sample point reports us — i.e., we're
+        confidently covered. False if at least one point shows us on top.
+        """
+        if not self.visible:
+            return False
+        try:
+            our_hwnd = int(self.win.wm_frame(), 16)
+            wx = self.win.winfo_x()
+            wy = self.win.winfo_y()
+            ww = self.strip_w
+        except (ValueError, tk.TclError):
+            return False
+        cy = wy + STRIP_H // 2
+        for frac in (0.05, 0.25, 0.5, 0.75, 0.95):
+            cx = wx + int(ww * frac)
+            pt = wintypes.POINT(cx, cy)
+            top_hwnd = _user32.WindowFromPoint(pt)
+            if not top_hwnd:
+                continue
+            root_hwnd = _user32.GetAncestor(top_hwnd, _GA_ROOT) or top_hwnd
+            if int(root_hwnd) == our_hwnd:
+                return False
+        return True
+
+    def _startup_bump(self) -> None:
+        """One-shot scheduled bump used by the post-launch burst (see __init__).
+
+        Autostart from Windows' Startup folder fires us before the shell
+        finishes initializing — the taskbar gets created AFTER us with
+        HWND_TOPMOST, and silently buries us. The once-per-second tick
+        bump eventually rescues us, but the user notices a missing strip
+        for a couple of seconds. The burst calls this several times during
+        the first ~10 s to win that race promptly.
+        """
+        if not self.visible:
+            return
+        self._force_topmost()
+        self._force_topmost_winapi()
+
     def show(self) -> None:
         self.visible = True
         self._reposition()
@@ -623,19 +749,14 @@ class TaskbarStrip:
         mx0, my0, wx0, wy0 = self._drag_anchor
         new_x = wx0 + (event.x_root - mx0)
         new_y = wy0 + (event.y_root - my0)
-        # Clamp X so at least ~60px stays on the primary monitor — otherwise
-        # a wild drag can leave the strip un-grabbable off-screen.
+        # Keep at least ~60 px on-screen on each axis so the strip is always
+        # grabbable. Y allowed all the way to the bottom — overlapping the
+        # taskbar is supported; _tick()'s _is_covered() detection plus the
+        # SetWindowPos backup keep us visible there.
         sw = self.win.winfo_screenwidth()
         sh = self.win.winfo_screenheight()
         new_x = max(-STRIP_W + 60, min(new_x, sw - 60))
-        # Clamp Y to STOP at the top of the Windows taskbar. We can't reliably
-        # render above the taskbar with a normal HWND_TOPMOST window — the
-        # taskbar is also HWND_TOPMOST and the simple `lift+topmost` bump trick
-        # we use doesn't outrank it. So we prevent the user from dragging into
-        # a zone where the strip would silently disappear.
-        tb_top = get_taskbar_top_logical(sh)
-        max_y = tb_top - STRIP_H
-        new_y = max(0, min(new_y, max_y))
+        new_y = max(0, min(new_y, sh - STRIP_H))
         self.win.geometry(f"+{new_x}+{new_y}")
 
     def _on_btn1_release(self, _event) -> None:
@@ -716,6 +837,16 @@ class TaskbarStrip:
             logging.getLogger(__name__).exception("strip render failed")
         if self.visible:
             self._reposition()
+            # _reposition() already bumps once per tick. If we detect we're
+            # actively covered right now (post-Settings flyout, post-Quick-
+            # Settings, post-autostart shell init), escalate with both the
+            # tkinter trick AND the direct SetWindowPos backup. This is the
+            # piece that keeps the strip visible when pinned over the
+            # taskbar — without it, we'd be stuck behind the taskbar
+            # whenever Windows re-asserted its z-order.
+            if self._is_covered():
+                self._force_topmost()
+                self._force_topmost_winapi()
         self.win.after(1000, self._tick)
 
     # Outline offsets — 4 cardinal directions, 1px out. (Diagonals add 4 more
