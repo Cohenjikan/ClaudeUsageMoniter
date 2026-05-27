@@ -32,6 +32,70 @@ from jsonl_costs import Aggregate
 from state import Orchestrator
 from usage_api import UsageSnapshot
 
+# ---- i18n ----
+# Module-level current-language state. set_app_language() rebinds it; t() looks
+# it up. Menu items use callable `text=` so they re-evaluate t() every time the
+# menu is shown, meaning a language switch takes effect on next menu open with
+# no menu rebuild. Strip text picks up the new language on its next render tick.
+LANGUAGES: dict[str, dict[str, str]] = {
+    "en": {
+        "show_window": "Show window",
+        "refresh_now": "Refresh now",
+        "settings": "Settings",
+        "show_strip": "Show taskbar strip",
+        "always_on_top": "Always on top (window)",
+        "opaque_bg": "Strip: opaque background",
+        "move_strip": "Move strip (drag with mouse)",
+        "reset_strip_position": "Reset strip position",
+        "display_mode": "Display mode",
+        "mode_1": "Compact (quota only)",
+        "mode_2": "+ Time remaining",
+        "mode_3": "+ Time-remaining %",
+        "language": "Language",
+        "quit": "Quit",
+        # Strip labels
+        "5h": "5h",
+        "7d": "7d",
+        "today": "today",
+    },
+    "zh": {
+        "show_window": "显示窗口",
+        "refresh_now": "立即刷新",
+        "settings": "设置",
+        "show_strip": "显示底部状态条",
+        "always_on_top": "窗口置顶",
+        "opaque_bg": "状态条不透明背景",
+        "move_strip": "拖动状态条",
+        "reset_strip_position": "重置状态条位置",
+        "display_mode": "显示模式",
+        "mode_1": "简洁 (仅额度)",
+        "mode_2": "+ 剩余时间",
+        "mode_3": "+ 剩余时间百分比",
+        "language": "语言",
+        "quit": "退出",
+        "5h": "5h",
+        "7d": "7d",
+        "today": "今日",
+    },
+}
+
+_current_lang = "en"
+
+
+def t(key: str) -> str:
+    return LANGUAGES.get(_current_lang, LANGUAGES["en"]).get(key, key)
+
+
+def get_app_language() -> str:
+    return _current_lang
+
+
+# Sliding-window total lengths, in minutes — used to compute "time remaining as
+# % of total window" for display mode 3.
+TOTAL_5H_MIN = 5 * 60
+TOTAL_7D_MIN = 7 * 24 * 60
+
+
 # ---- Visual constants (dark theme) ----
 BG = "#1e1f22"          # window background
 PANEL = "#2b2d31"       # subdued panel background
@@ -89,6 +153,17 @@ def save_config(cfg: dict) -> None:
             json.dump(cfg, f, indent=2)
     except OSError as e:
         logging.getLogger(__name__).warning("failed to save config: %s", e)
+
+
+def set_app_language(lang: str) -> None:
+    """Switch the UI language and persist the choice."""
+    global _current_lang
+    if lang not in LANGUAGES:
+        return
+    _current_lang = lang
+    cfg = load_config()
+    cfg["language"] = lang
+    save_config(cfg)
 
 
 # ---- Win32 helpers for taskbar position detection ----
@@ -390,6 +465,10 @@ class TaskbarStrip:
         # cleaner over the taskbar). Useful when the strip is dragged onto a
         # light desktop area where outlined text alone is hard to read.
         self.show_background = bool(cfg.get("show_background", False))
+        # Display mode: 1=quota only, 2=quota + time remaining, 3=quota + time-remaining %.
+        # Cap to the valid range so a hand-edited config can't put us in a weird state.
+        raw_mode = cfg.get("display_mode", 1)
+        self.display_mode = raw_mode if raw_mode in (1, 2, 3) else 1
 
         self.win = tk.Toplevel(parent_root)
         self.win.overrideredirect(True)         # no title bar / borders
@@ -562,6 +641,20 @@ class TaskbarStrip:
         except Exception:
             logging.getLogger(__name__).exception("strip redraw on bg toggle failed")
 
+    def set_display_mode(self, mode: int) -> None:
+        """Switch display_mode (1/2/3) and persist. Triggers an immediate redraw."""
+        if mode not in (1, 2, 3):
+            return
+        self.display_mode = mode
+        cfg = load_config()
+        cfg.setdefault("strip", {})
+        cfg["strip"]["display_mode"] = mode
+        save_config(cfg)
+        try:
+            self._render(self.orch.snapshot())
+        except Exception:
+            logging.getLogger(__name__).exception("strip redraw on mode change failed")
+
     def _on_right_click(self, event) -> None:
         try:
             self._menu.tk_popup(event.x_root, event.y_root)
@@ -593,23 +686,49 @@ class TaskbarStrip:
         self.canvas.create_text(x, y, text=text, fill=fg, font=font, anchor="w")
         return font.measure(text)
 
+    def _append_quota_parts(self, parts: list, label_key: str, quota_pct: float,
+                            mins_remaining: int, total_window_min: int) -> None:
+        """Append the (text, color, font) pieces for one quota's display in the
+        currently selected display_mode. Caller is responsible for any leading
+        separator. Pieces are appended in reading order (caller packs left-to-right
+        OR right-to-left based on STRIP_SIDE).
+        """
+        parts.append((t(label_key) + " ", FG_DIM, self.font_dim))
+        quota_color = color_for_pct(quota_pct)
+        if self.display_mode == 1:
+            # Mode 1: just the quota%
+            parts.append((f"{quota_pct:.0f}%", quota_color, self.font_main))
+        elif self.display_mode == 2:
+            # Mode 2: quota% (time remaining)
+            parts.append((f"{quota_pct:.0f}%", quota_color, self.font_main))
+            parts.append((f" ({fmt_minutes(mins_remaining)})", FG_DIM, self.font_dim))
+        else:  # mode 3
+            # Mode 3: quota% / time-remaining-as-pct-of-total-window
+            time_pct = 0
+            if total_window_min > 0:
+                time_pct = max(0, min(100, int(mins_remaining / total_window_min * 100)))
+            parts.append((f"{quota_pct:.0f}%", quota_color, self.font_main))
+            parts.append(("/", FG_DIM, self.font_dim))
+            parts.append((f"{time_pct}%", FG, self.font_main))
+
     def _render(self, s) -> None:
         u = s.usage
         rpt = s.report
 
         # Build the ordered list of (text, color, font) pieces. Caption pieces
-        # use FG_DIM; value pieces use the threshold-based color.
+        # use FG_DIM; value pieces use the threshold-based color. Layout depends
+        # on the current display_mode (selected from the tray Settings submenu).
         parts: list[tuple[str, str, tkfont.Font]] = []
         if u is not None:
-            parts.append(("5h ", FG_DIM, self.font_dim))
-            parts.append((f"{u.five_hour_pct:.0f}%", color_for_pct(u.five_hour_pct), self.font_main))
+            self._append_quota_parts(parts, "5h", u.five_hour_pct,
+                                     u.five_hour_minutes_to_reset, TOTAL_5H_MIN)
             parts.append(("   ·   ", FG_DIM, self.font_dim))
-            parts.append(("7d ", FG_DIM, self.font_dim))
-            parts.append((f"{u.seven_day_pct:.0f}%", color_for_pct(u.seven_day_pct), self.font_main))
+            self._append_quota_parts(parts, "7d", u.seven_day_pct,
+                                     u.seven_day_minutes_to_reset, TOTAL_7D_MIN)
         if rpt is not None:
             if u is not None:
                 parts.append(("   ·   ", FG_DIM, self.font_dim))
-            parts.append(("today ", FG_DIM, self.font_dim))
+            parts.append((t("today") + " ", FG_DIM, self.font_dim))
             parts.append((f"${rpt.today.cost_usd:,.2f}", FG, self.font_main))
         if not parts:
             return  # nothing to draw yet (initial state before first data lands)
@@ -667,38 +786,75 @@ class TrayApp:
         )
 
     def _build_menu(self) -> pystray.Menu:
-        items = [
-            pystray.MenuItem("Show window", self._on_show, default=True),
-            pystray.MenuItem("Always on top",
-                             lambda _i, item: self._on_topmost_toggle(item),
-                             checked=lambda item: bool(self.window.topmost_var.get())),
-        ]
-        if self.strip is not None:
-            items.append(pystray.MenuItem(
-                "Show taskbar strip",
-                lambda _i, _item: self._on_strip_toggle(),
-                checked=lambda item: bool(self.strip and self.strip.visible),
-            ))
-            items.append(pystray.MenuItem(
-                "Strip: opaque background",
-                lambda _i, _item: self._on_strip_bg_toggle(),
-                checked=lambda item: bool(self.strip and self.strip.show_background),
-            ))
-            items.append(pystray.MenuItem(
-                "Move strip (drag with mouse)",
-                lambda _i, _item: self._on_strip_drag_toggle(),
-                checked=lambda item: bool(self.strip and self.strip.drag_mode),
-            ))
-            items.append(pystray.MenuItem(
-                "Reset strip position",
-                lambda _i, _item: self._on_strip_reset(),
-            ))
-        items.extend([
-            pystray.MenuItem("Refresh now", lambda _i: self.orch.refresh_now()),
+        # Top level kept to 4 items. Everything configurable lives under
+        # Settings → ... — nested submenus keep the right-click menu short and
+        # the daily-driver actions (Show / Refresh / Quit) immediately visible.
+        return pystray.Menu(
+            pystray.MenuItem(lambda _i: t("show_window"), self._on_show, default=True),
+            pystray.MenuItem(lambda _i: t("refresh_now"),
+                             lambda _i: self.orch.refresh_now()),
+            pystray.MenuItem(lambda _i: t("settings"), self._build_settings_menu()),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit", self._on_quit),
-        ])
-        return pystray.Menu(*items)
+            pystray.MenuItem(lambda _i: t("quit"), self._on_quit),
+        )
+
+    def _build_settings_menu(self) -> pystray.Menu:
+        """Settings submenu — visibility/appearance/behavior, plus nested
+        display-mode and language pickers."""
+        return pystray.Menu(
+            # Strip-related toggles
+            pystray.MenuItem(
+                lambda _i: t("show_strip"),
+                lambda _i, _it: self._on_strip_toggle(),
+                checked=lambda _it: bool(self.strip and self.strip.visible),
+            ),
+            pystray.MenuItem(
+                lambda _i: t("opaque_bg"),
+                lambda _i, _it: self._on_strip_bg_toggle(),
+                checked=lambda _it: bool(self.strip and self.strip.show_background),
+            ),
+            pystray.MenuItem(
+                lambda _i: t("move_strip"),
+                lambda _i, _it: self._on_strip_drag_toggle(),
+                checked=lambda _it: bool(self.strip and self.strip.drag_mode),
+            ),
+            pystray.MenuItem(
+                lambda _i: t("reset_strip_position"),
+                lambda _i, _it: self._on_strip_reset(),
+            ),
+            # Sub-sub-menus
+            pystray.MenuItem(lambda _i: t("display_mode"), self._build_display_mode_menu()),
+            pystray.MenuItem(lambda _i: t("language"), self._build_language_menu()),
+            pystray.Menu.SEPARATOR,
+            # Window-related
+            pystray.MenuItem(
+                lambda _i: t("always_on_top"),
+                lambda _i, _it: self._on_topmost_toggle(_it),
+                checked=lambda _it: bool(self.window.topmost_var.get()),
+            ),
+        )
+
+    def _build_display_mode_menu(self) -> pystray.Menu:
+        """Radio-style picker for the three strip layouts."""
+        def make(mode: int, label_key: str) -> pystray.MenuItem:
+            return pystray.MenuItem(
+                lambda _i: t(label_key),
+                lambda _i, _it: self._on_set_display_mode(mode),
+                checked=lambda _it: bool(self.strip and self.strip.display_mode == mode),
+                radio=True,
+            )
+        return pystray.Menu(make(1, "mode_1"), make(2, "mode_2"), make(3, "mode_3"))
+
+    def _build_language_menu(self) -> pystray.Menu:
+        """Radio-style picker for UI language. Currently English + 中文."""
+        def make(code: str, label: str) -> pystray.MenuItem:
+            return pystray.MenuItem(
+                label,  # static — language names are conventionally untranslated
+                lambda _i, _it: self._on_set_language(code),
+                checked=lambda _it: get_app_language() == code,
+                radio=True,
+            )
+        return pystray.Menu(make("en", "English"), make("zh", "中文"))
 
     def _on_strip_toggle(self) -> None:
         if self.strip is None:
@@ -724,6 +880,21 @@ class TrayApp:
         if self.strip is None:
             return
         self.window.root.after(0, self.strip.reset_position)
+
+    def _on_set_display_mode(self, mode: int) -> None:
+        if self.strip is None:
+            return
+        self.window.root.after(0, lambda: self.strip.set_display_mode(mode))
+
+    def _on_set_language(self, lang: str) -> None:
+        # Language is global; menu text is callable so it'll re-evaluate on
+        # next menu open. The strip picks up the new language on its next
+        # render tick automatically.
+        set_app_language(lang)
+        # Force an immediate strip redraw so labels update before the next
+        # natural tick — feels more responsive than waiting 1s.
+        if self.strip is not None:
+            self.window.root.after(0, lambda: self.strip._render(self.orch.snapshot()))
 
     def _on_show(self, _icon=None, _item=None) -> None:
         # tkinter calls must happen on the main thread.
@@ -777,6 +948,13 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+
+    # Restore the saved language before any UI is built — menu and strip both
+    # read it at render time, so setting it here makes the first frame correct.
+    global _current_lang
+    saved_lang = load_config().get("language")
+    if isinstance(saved_lang, str) and saved_lang in LANGUAGES:
+        _current_lang = saved_lang
 
     orch = Orchestrator()
     # Wire callbacks AFTER constructing window+tray so we can reference them.
