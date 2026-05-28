@@ -126,9 +126,13 @@ TEXT_OUTLINE = "#000000"
 STRIP_W, STRIP_H = 360, 26
 STRIP_SIDE = "left"         # "left" or "right" — which side of the screen to pin to
 STRIP_SIDE_MARGIN = 12      # gap from the chosen screen edge
-# Pinning the strip OVER the Windows taskbar is fully supported — drag it
-# anywhere on screen and it'll stick. Z-order is inherently contentious there
-# (the taskbar is HWND_TOPMOST too), so we defend with three mechanisms:
+# The strip pins ON the Windows taskbar by default (get_strip_default_y centers
+# it in the taskbar band). This placement is deliberate and load-bearing:
+# maximized windows fill only the work area (which ends at the taskbar's top
+# edge), so a strip sitting in the taskbar band is structurally immune to being
+# covered by them — the failure that kept biting us when the default was "just
+# above the taskbar". Z-order there is still contended by the taskbar's own
+# HWND_TOPMOST window, so we defend with three mechanisms:
 #   (1) every tick (1s) we re-bump topmost via the tkinter "off→on + lift"
 #       trick, plus a direct SetWindowPos(HWND_TOPMOST) for stubborn cases
 #   (2) a burst of bumps in the first ~10 seconds after launch — autostart
@@ -136,7 +140,9 @@ STRIP_SIDE_MARGIN = 12      # gap from the chosen screen edge
 #   (3) WindowFromPoint sampling detects when something IS in front of us
 #       (Quick Settings, Notification Center, the taskbar itself after an
 #       autostart race) and escalates the bump immediately
-STRIP_GAP_FROM_TASKBAR = 0  # gap between strip bottom and taskbar top
+# STRIP_GAP_FROM_TASKBAR is retained for users who prefer the strip floating
+# above the taskbar — set it >0 and adjust get_strip_default_y if desired.
+STRIP_GAP_FROM_TASKBAR = 0  # legacy: gap between strip bottom and taskbar top
 
 
 # ---- Persistent config (just strip position for now) ----
@@ -234,6 +240,35 @@ def get_taskbar_top_logical(fallback_screen_h: int) -> int:
     # value is just where the work area ends downward — still a reasonable spot
     # to pin a strip on the primary monitor.
     return rect.bottom
+
+
+def get_strip_default_y(screen_h: int) -> int:
+    """Y coordinate that vertically centers the strip *inside* the taskbar band.
+
+    This is the crux of keeping the strip reliably visible. A maximized normal
+    window can only ever fill the work area, whose bottom edge is the taskbar's
+    top edge. So:
+
+      * Placing the strip JUST ABOVE the taskbar (the old default, y = tb_top -
+        STRIP_H) puts it in the bottom sliver of the work area — exactly where
+        a maximized app (Chrome, the Claude desktop app, an editor) covers it.
+        That was the regression: a position-reset dropped the strip there and
+        every maximized window hid it.
+
+      * Placing the strip ON the taskbar (y >= tb_top) makes it structurally
+        unreachable by maximized windows. The only thing that contends for
+        z-order there is the taskbar's own HWND_TOPMOST window, and the
+        per-tick force-topmost bump + _is_covered() escalation win that fight.
+
+    Falls back to a standard 48 px taskbar height if the detected band looks
+    implausible (e.g. an auto-hide or side-docked taskbar reporting a weird
+    work-area bottom).
+    """
+    tb_top = get_taskbar_top_logical(screen_h)
+    tb_height = screen_h - tb_top
+    if tb_height <= 0 or tb_height > 200:
+        tb_height = 48
+    return tb_top + max(0, (tb_height - STRIP_H) // 2)
 
 
 def color_for_pct(pct: float) -> str:
@@ -622,7 +657,10 @@ class TaskbarStrip:
                     x = STRIP_SIDE_MARGIN
                 else:
                     x = sw - self.strip_w - STRIP_SIDE_MARGIN
-                y = get_taskbar_top_logical(sh) - STRIP_H - STRIP_GAP_FROM_TASKBAR
+                # Default sits ON the taskbar (centered in its band), NOT just
+                # above it — see get_strip_default_y for why that's the only
+                # placement maximized windows can't cover.
+                y = get_strip_default_y(sh)
             self.win.geometry(f"{self.strip_w}x{STRIP_H}+{x}+{y}")
         self._force_topmost()
 
