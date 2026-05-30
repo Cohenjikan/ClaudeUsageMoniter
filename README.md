@@ -22,10 +22,17 @@ re-login) + **clean tkinter UI** + **per-project cost** from local JSONL.
 
 ## What it shows
 
-- **5-hour rolling quota** — real % from Anthropic's server (not estimated)
+- **5-hour rolling quota** — real % from Anthropic's server (not estimated).
+  Includes *all* subscription usage: Claude Code **and** chat/desktop/web.
 - **Weekly quota** — same source, color-coded at 75% / 90% / 95%
 - **Per-project cost** — equivalent API $ from `~/.claude/projects/**/*.jsonl`
 - **Session / today / this-month** rollups
+
+> **Note:** the **$ amounts are Claude Code (CLI) only** — they come from local
+> CLI transcripts. Chat / desktop-app usage isn't logged locally, so it shows
+> up in the 5h/7d **%** bars but **not** in the $ figures. "Today $" stays $0.00
+> on days you only chat. See [Caveats](#caveats).
+
 - **Threshold toasts** — Windows native notifications when crossing 75/90/95%
 
 Two UIs, both optional:
@@ -120,6 +127,14 @@ rates or releases new model families.
   "run /login in Claude Code" message in the strip footer (very rare).
 - **Local cost is API-equivalent**, not what you actually pay (you pay flat
   Pro/Max subscription). Useful for comparing project value, not billing.
+- **The $ figures are Claude Code (CLI) only.** Today / session / this-month /
+  per-project dollars are computed purely from Claude Code's local transcripts
+  in `~/.claude/projects/`. Usage from the **Claude desktop app or web chat is
+  NOT counted** — those don't write local transcripts with token counts. So on
+  a day you only use chat, **"Today $" stays $0.00 and only refreshes once you
+  actually use Claude Code.** The 5h / 7d **percentage** bars are different:
+  they come from the server usage endpoint and DO include chat + code together,
+  so that's the number to watch if you mix the two.
 - **Cache pricing**: `cache_creation_input_tokens` has two tiers (5-minute
   and 1-hour ephemeral) — both are tracked and priced separately.
 - **Multi-monitor**: strip always pins to the primary monitor. Drag-mode
