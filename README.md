@@ -4,6 +4,8 @@
 
 ### A featherweight Windows tray app that shows your real Claude Code Pro/Max quota live — piggybacking Claude Code's own login so you never log in twice.
 
+**English** · **[中文](README.zh.md)**
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-22c55e.svg?style=flat-square)](LICENSE)
 [![Platform: Windows 10/11](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6.svg?style=flat-square&logo=windows&logoColor=white)](#requirements)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB.svg?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
