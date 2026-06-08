@@ -35,7 +35,7 @@ You live in Claude Code all day. You keep hitting the 5-hour wall or the weekly 
 
 **ClaudeUsageMonitor pins the authoritative numbers to your taskbar and stays out of your way.** It reads the same OAuth token Claude Code already wrote to disk, calls Anthropic's own usage endpoint, and shows you exactly how close you are to the limit — before you slam into it.
 
-> 🔑 **The trick:** it borrows Claude Code's local OAuth token at `~/.claude/.credentials.json` and refreshes it atomically when it expires. There is **no login screen anywhere in this app** — install it and it just works.
+> **The trick:** it borrows Claude Code's local OAuth token at `~/.claude/.credentials.json` and refreshes it atomically when it expires. There is **no login screen anywhere in this app** — install it and it just works.
 
 ---
 
@@ -43,57 +43,57 @@ You live in Claude Code all day. You keep hitting the 5-hour wall or the weekly 
 
 Benefit first, mechanism second. Everything below is wired to real code in this repo.
 
-### 🚫 Zero separate login (OAuth piggyback)
+### Zero separate login (OAuth piggyback)
 Install and it just works, using the Claude Code session you already have. Nothing to sign into, ever.
 > `usage_api.py` reads `~/.claude/.credentials.json` and re-reads it from disk on **every** call (`load_oauth_creds`, lines 89–112), so it automatically picks up tokens that Claude Code itself rotates. There is no login UI anywhere in the codebase.
 
-### 📊 Real server-side quota, not an estimate
+### Real server-side quota, not an estimate
 The 5-hour and weekly percentages are the *same authoritative numbers Claude Code uses*, and they include **all** of your subscription usage — Code **plus** chat/desktop/web — not a guess from local logs.
 > `fetch_usage` (`usage_api.py:189`) GETs `https://api.anthropic.com/api/oauth/usage` and reads `five_hour.utilization` / `seven_day.utilization` straight from the response. The endpoint is undocumented; the `User-Agent` must be `claude-code/2.0.0` or it lands in a tighter rate-limit bucket.
 
-### 🔄 Automatic, atomic token refresh
+### Automatic, atomic token refresh
 Tokens expire roughly every 8 hours, but under normal use you never have to `/login` again — refreshes happen silently and safely in the background.
 > `refresh_and_save` (`usage_api.py:170`) refreshes via `console.anthropic.com/v1/oauth/token`, then `save_oauth_creds` writes to a `.json.tmp` and `Path.replace()`s it (lines 145–167) — atomic, and every other credential field is preserved. `state.py` rate-limits refreshes to one per 5 min, and if the refresh token has rotated out from under it (`invalid_grant`) it backs off an hour and asks you to `/login` in Claude Code.
 
-### 📌 Always-visible taskbar strip
+### Always-visible taskbar strip
 A tiny borderless readout sits right on the Windows taskbar, so your quota is glanceable without opening anything.
 
 ![The borderless taskbar strip pinned inside the Windows 11 taskbar band, showing live 5h and weekly quota](screenshots/strip.png)
 
 > `TaskbarStrip` (`app.py:515+`) is a borderless `overrideredirect` `Toplevel` with a nominal `STRIP_W, STRIP_H = 360, 26`, pinned inside the taskbar band via `get_strip_default_y`. Its width auto-grows to fit the rendered text each tick — it is not a fixed-width bar.
 
-### 🛡️ Stays on top of the Win11 shell
+### Stays on top of the Win11 shell
 The strip doesn't get buried by maximized windows, the taskbar, or autostart races at boot.
 > Three defenses in `app.py`: a per-tick topmost bump (`_force_topmost`), a direct `SetWindowPos(HWND_TOPMOST)` backup (`_force_topmost_winapi`), and `WindowFromPoint` multi-point coverage detection (`_is_covered`) — plus a startup bump burst from 300 ms to 10 s.
 
-### 🖱️ Drag-to-place, position persists
+### Drag-to-place, position persists
 Put the strip wherever you like; it stays there across restarts.
 > Move-strip drag mode saves x/y to a per-user `config.json` next to the script on mouse release (`_on_btn1_release`); on the next launch the strip restores that saved position. `reset_position` snaps it back to defaults.
 
-### 💵 Per-project / today / month / session cost
+### Per-project / today / month / session cost
 See which projects burn the most equivalent-API dollars, plus running today/month totals — handy for comparing project value.
 > `jsonl_costs.py` parses `~/.claude/projects/**/*.jsonl` (`iter_turns`) and aggregates into `by_project`, `by_session`, `today`, `this_month` (`build_report`). Day/month boundaries use your **local** timezone.
 
-### 🧮 Two-tier cache pricing
+### Two-tier cache pricing
 Cost estimates respect Anthropic's split cache-creation pricing, so the equivalent-$ figure is closer to reality.
 > `PRICING` (`jsonl_costs.py:21`) holds separate `cache_5m` and `cache_1h` rates per model; `_parse_turn` reads `ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens` and prices them independently.
 
-### 🔔 Native threshold toasts at 75 / 90 / 95%
+### Native threshold toasts at 75 / 90 / 95%
 Windows pops a notification before you hit the wall, with escalating wording as you approach the limit.
 > `Orchestrator.THRESHOLDS = (75, 90, 95)` (`state.py:76`); `_check_thresholds` fires once per crossing and re-arms when usage drops below; `notify()` sends a `winotify` toast whose body escalates at 90% and 95%.
 
-### 🪟 Full-detail floating window
+### Full-detail floating window
 Click the strip or tray for a dark card with quota bars, reset countdowns, cost rollups, and a top-projects list.
 
 ![The dark floating detail window: color-coded 5h and 7-day quota bars, live reset countdowns, session/today/month cost, and a top-projects list (demo data)](screenshots/window.png)
 
 > `FloatingWindow` (`app.py:321+`) renders color-coded 5h/7d bars, live "resets in Xm" countdowns (repaints every 1 s), session/today/month costs, and up to 6 top-project rows. Hidden by default.
 
-### 🎯 Tray icon shows live 5h%
+### Tray icon shows live 5h%
 Even with no windows open, the system-tray badge tells you your 5-hour usage at a glance, color-coded by severity.
 > `render_tray_icon` (`app.py:282`) draws the integer 5h% on a rounded rect colored by `color_for_pct` (green / orange / red), updated on every state change.
 
-### 🌐 Bilingual UI and configurable strip layout
+### Bilingual UI and configurable strip layout
 Switch between English and Chinese, and choose how much detail the strip shows — all from the tray menu.
 > `LANGUAGES` holds `en` and `zh` dicts; the tray Settings submenu offers a language picker and four display modes (compact / +time-remaining / +time-remaining% / +time-elapsed%).
 
@@ -180,11 +180,11 @@ This project takes what it wanted from all three: **OAuth-piggyback auth** (zero
 
 ---
 
-## ⚠️ Honest caveats (trust is a feature)
+## Honest caveats (trust is a feature)
 
 Read these before you rely on the numbers. They are deliberate, not bugs.
 
-- **The `$` figures are Claude Code (CLI) only.** Today / session / month / per-project dollars come **purely** from local `~/.claude/projects` transcripts. The Claude **desktop app and web chat write no local token counts**, so on a chat-only day **"Today $" stays $0.00**. ⚠️ The 5h/7d **percent** bars are different — those come from the server and **do** include chat + code together. That's the number to watch if you mix the two.
+- **The `$` figures are Claude Code (CLI) only.** Today / session / month / per-project dollars come **purely** from local `~/.claude/projects` transcripts. The Claude **desktop app and web chat write no local token counts**, so on a chat-only day **"Today $" stays $0.00**. The 5h/7d **percent** bars are different — those come from the server and **do** include chat + code together. That's the number to watch if you mix the two.
 - **Equivalent-API $ is for comparison, not billing.** You pay a flat Pro/Max subscription. These dollars estimate what the same tokens would cost on the pay-as-you-go API — useful for ranking project value, not for your invoice.
 - **Server quota updates at most every 6 minutes.** The `/api/oauth/usage` endpoint is aggressively rate-limited (~5 requests/token), so percentages can lag real-time usage by a few minutes. Local JSONL cost refreshes every 30 s.
 - **The strip defaults to your primary monitor.** A dragged position can land on a secondary monitor; **Reset strip position** returns it to primary.
@@ -247,7 +247,7 @@ This is an unofficial, community-built tool. It is not affiliated with, endorsed
 
 <div align="center">
 
-**If this saves you from one rate-limit surprise, give it a ⭐.**
+**If this saves you from one rate-limit surprise, consider giving it a star.**
 
 [Report an issue](https://github.com/Cohenjikan/ClaudeUsageMoniter/issues) · [Repo](https://github.com/Cohenjikan/ClaudeUsageMoniter)
 

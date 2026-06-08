@@ -7,7 +7,7 @@
 **[English](README.md)** · **中文**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-22c55e.svg?style=flat-square)](LICENSE)
-[![Platform: Windows 10/11](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6.svg?style=flat-square&logo=windows&logoColor=white)](#requirements)
+[![Platform: Windows 10/11](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6.svg?style=flat-square&logo=windows&logoColor=white)](#环境要求)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB.svg?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![GitHub stars](https://img.shields.io/github/stars/Cohenjikan/ClaudeUsageMoniter?style=flat-square&logo=github&color=f59e0b)](https://github.com/Cohenjikan/ClaudeUsageMoniter/stargazers)
 
@@ -31,11 +31,11 @@
 
 ## 为什么你会想要它
 
-你整天都泡在 Claude Code 里，却总是撞上 5 小时上限或每周封顶——而且往往是*等到 Claude 提示你时才知道*。现有的监控工具要么界面像坏掉的电子表格，要么每隔几小时就逼你重新过一遍浏览器登录，要么只统计本地日志、从不显示真实的服务端配额。
+你每天大量使用 Claude Code，却总是撞上 5 小时上限或每周封顶——而且往往是*等到 Claude 提示你时才知道*。现有的监控工具要么界面像坏掉的电子表格，要么每隔几小时就逼你重新过一遍浏览器登录，要么只统计本地日志、从不显示真实的服务端配额。
 
-**ClaudeUsageMonitor 把权威数字钉在你的任务栏上，又绝不碍事。** 它读取 Claude Code 已经写到磁盘上的同一份 OAuth 令牌，调用 Anthropic 官方的用量接口，准确告诉你离上限还有多远——赶在你一头撞上之前。
+**ClaudeUsageMonitor 把权威数字钉在你的任务栏上，又绝不碍事。** 它读取 Claude Code 已经写到磁盘上的同一份 OAuth 令牌，调用 Anthropic 官方的用量接口，准确告诉你离上限还有多远——在你触顶之前。
 
-> 🔑 **诀窍所在：** 它借用 Claude Code 位于 `~/.claude/.credentials.json` 的本地 OAuth 令牌，并在令牌过期时原子化地刷新。本应用**没有任何登录界面**——装好即用。
+> **诀窍所在：** 它借用 Claude Code 位于 `~/.claude/.credentials.json` 的本地 OAuth 令牌，并在令牌过期时原子化地刷新。本应用**没有任何登录界面**——装好即用。
 
 ---
 
@@ -43,57 +43,57 @@
 
 收益在前，机制在后。以下每一项都对应着本仓库中真实的代码。
 
-### 🚫 零额外登录（OAuth 借用）
+### 零额外登录（OAuth 借用）
 装好即用，直接复用你已有的 Claude Code 会话。永远无需登录任何东西。
 > `usage_api.py` 读取 `~/.claude/.credentials.json`，并在**每一次**调用时都从磁盘重新读取（`load_oauth_creds`，第 89–112 行），因此能自动接住 Claude Code 自己轮换出的新令牌。整个代码库中不存在任何登录 UI。
 
-### 📊 真实服务端配额，而非估算
+### 真实服务端配额，而非估算
 5 小时与每周百分比就是 *Claude Code 所使用的同一份权威数字*，并且涵盖你**全部**订阅用量——Code **加上** chat/desktop/web——而不是从本地日志猜出来的。
 > `fetch_usage`（`usage_api.py:189`）向 `https://api.anthropic.com/api/oauth/usage` 发起 GET 请求，直接从响应中读取 `five_hour.utilization` / `seven_day.utilization`。该接口未公开文档；`User-Agent` 必须是 `claude-code/2.0.0`，否则会被归入更严格的限流桶。
 
-### 🔄 自动、原子化的令牌刷新
+### 自动、原子化的令牌刷新
 令牌大约每 8 小时过期一次，但在正常使用下你永远不必再次 `/login`——刷新会在后台静默且安全地完成。
 > `refresh_and_save`（`usage_api.py:170`）通过 `console.anthropic.com/v1/oauth/token` 刷新，随后 `save_oauth_creds` 先写入 `.json.tmp` 再 `Path.replace()` 替换（第 145–167 行）——整个过程原子化，且保留其它所有凭据字段。`state.py` 将刷新限流为每 5 分钟一次；若刷新令牌在背后被轮换失效（`invalid_grant`），它会退避一小时，并提示你在 Claude Code 中 `/login`。
 
-### 📌 始终可见的任务栏条
+### 始终可见的任务栏条
 一条极小的无边框读数条直接停靠在 Windows 任务栏上，无需打开任何窗口即可一瞥配额。
 
 ![无边框任务栏条，嵌在 Windows 11 任务栏区域内，实时显示 5 小时与每周配额](screenshots/strip.png)
 
 > `TaskbarStrip`（`app.py:515+`）是一个无边框的 `overrideredirect` `Toplevel`，标称尺寸为 `STRIP_W, STRIP_H = 360, 26`，通过 `get_strip_default_y` 钉在任务栏区域内。它的宽度会在每个刷新周期自动伸缩以容纳渲染出的文字——并非固定宽度的条。
 
-### 🛡️ 稳压 Win11 外壳之上
+### 稳压 Win11 外壳之上
 任务栏条不会被最大化窗口、任务栏或开机时的自启动竞争所遮挡。
 > `app.py` 中有三道防线：每周期的置顶补偿（`_force_topmost`）、直接的 `SetWindowPos(HWND_TOPMOST)` 兜底（`_force_topmost_winapi`），以及基于 `WindowFromPoint` 的多点遮挡检测（`_is_covered`）——外加一段从 300 毫秒持续到 10 秒的启动置顶补偿连击。
 
-### 🖱️ 拖拽定位，位置持久化
+### 拖拽定位，位置持久化
 把它放到你喜欢的任何位置；重启后依旧停在那里。
 > 移动模式下，在松开鼠标时把 x/y 坐标保存到脚本同目录、按用户区分的 `config.json`（`_on_btn1_release`）；下次启动时任务栏条会恢复到该保存位置。`reset_position` 可将其复位到默认位置。
 
-### 💵 按项目／今日／本月／会话的花费
+### 按项目／今日／本月／会话的花费
 看清哪些项目烧掉了最多的等效 API 费用，再配上今日／本月的累计——便于对比各项目的价值。
 > `jsonl_costs.py` 解析 `~/.claude/projects/**/*.jsonl`（`iter_turns`），并聚合成 `by_project`、`by_session`、`today`、`this_month`（`build_report`）。日／月的边界以你的**本地**时区为准。
 
-### 🧮 两档缓存定价
+### 两档缓存定价
 费用估算遵循 Anthropic 拆分的缓存创建定价，因此等效美元数字更贴近实际。
 > `PRICING`（`jsonl_costs.py:21`）为每个模型分别保存 `cache_5m` 与 `cache_1h` 费率；`_parse_turn` 读取 `ephemeral_5m_input_tokens` 与 `ephemeral_1h_input_tokens`，并独立计价。
 
-### 🔔 75 / 90 / 95% 原生阈值提醒
+### 75 / 90 / 95% 原生阈值提醒
 在你撞上上限之前，Windows 会弹出通知，措辞随着你逼近上限而逐级升级。
 > `Orchestrator.THRESHOLDS = (75, 90, 95)`（`state.py:76`）；`_check_thresholds` 在每次越过阈值时触发一次，并在用量回落后重新就绪；`notify()` 发送 `winotify` 通知，其正文在 90% 与 95% 时逐级升级。
 
-### 🪟 完整详情悬浮窗
+### 完整详情悬浮窗
 点击任务栏条或托盘图标，即可打开一张深色卡片，内含配额进度条、重置倒计时、花费汇总以及高消耗项目列表。
 
 ![深色悬浮详情窗口：分色显示的 5 小时与 7 天配额进度条、实时重置倒计时、会话／今日／本月花费，以及高消耗项目列表（演示数据）](screenshots/window.png)
 
 > `FloatingWindow`（`app.py:321+`）渲染分色的 5h/7d 进度条、实时的「Xm 后重置」倒计时（每 1 秒重绘）、会话／今日／本月花费，以及最多 6 行高消耗项目。默认隐藏。
 
-### 🎯 托盘图标实时显示 5h%
+### 托盘图标实时显示 5h%
 即便没有打开任何窗口，系统托盘徽标也能让你一眼看到 5 小时用量，并按严重程度分色。
 > `render_tray_icon`（`app.py:282`）在一个圆角矩形上绘制 5h% 整数值，颜色由 `color_for_pct` 决定（绿／橙／红），并在每次状态变化时更新。
 
-### 🌐 双语界面与可配置的任务栏条布局
+### 双语界面与可配置的任务栏条布局
 在中英文之间切换，并选择任务栏条显示多少细节——全都在托盘菜单里完成。
 > `LANGUAGES` 保存 `en` 与 `zh` 两套字典；托盘的 Settings 子菜单提供语言选择器以及四种显示模式（紧凑 / +剩余时间 / +剩余时间% / +已用时间%）。
 
@@ -180,11 +180,11 @@ flowchart LR
 
 ---
 
-## ⚠️ 诚实的注意事项（可信本身就是一项特性）
+## 诚实的注意事项（可信本身就是一项特性）
 
 在你依赖这些数字之前，请先读完它们。它们是有意为之，而非缺陷。
 
-- **`$` 金额仅涵盖 Claude Code（CLI）。** 今日／会话／本月／按项目的美元数**纯粹**来自本地 `~/.claude/projects` 的会话记录。Claude **桌面应用与网页 chat 不会写入任何本地 token 计数**，因此在只用 chat 的日子里，**「今日 $」会停留在 $0.00**。⚠️ 5h/7d 的**百分比**进度条则不同——它们来自服务端，**确实**把 chat 与 code 一并计入。如果你两者混用，这才是该盯紧的数字。
+- **`$` 金额仅涵盖 Claude Code（CLI）。** 今日／会话／本月／按项目的美元数**纯粹**来自本地 `~/.claude/projects` 的会话记录。Claude **桌面应用与网页 chat 不会写入任何本地 token 计数**，因此在只用 chat 的日子里，**「今日 $」会停留在 $0.00**。 5h/7d 的**百分比**进度条则不同——它们来自服务端，**确实**把 chat 与 code 一并计入。如果你两者混用，这才是该盯紧的数字。
 - **等效 API $ 仅供对比，不用于计费。** 你支付的是固定的 Pro/Max 订阅费。这些美元估算的是同样的 token 在按量付费 API 上会花多少钱——用于给项目价值排序很有用，但不对应你的账单。
 - **服务端配额最多每 6 分钟更新一次。** `/api/oauth/usage` 接口限流相当严格（约每令牌 5 次请求），因此百分比可能比实时用量滞后几分钟。本地 JSONL 花费每 30 秒刷新一次。
 - **任务栏条默认显示在主显示器上。** 拖动后的位置可能落到副显示器上；**重置任务栏条位置**会让它回到主显示器。
@@ -247,7 +247,7 @@ STRIP_GAP_FROM_TASKBAR = 0        # 任务栏条底部与任务栏顶部之间�
 
 <div align="center">
 
-**如果它让你免于哪怕一次限流惊吓，请赏个 ⭐。**
+**如果它让你免于哪怕一次限流惊吓，欢迎点个 Star。**
 
 [反馈问题](https://github.com/Cohenjikan/ClaudeUsageMoniter/issues) · [仓库](https://github.com/Cohenjikan/ClaudeUsageMoniter)
 
