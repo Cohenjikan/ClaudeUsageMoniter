@@ -73,6 +73,7 @@ Put the strip wherever you like; it stays there across restarts.
 ### Per-project / today / month / session cost
 See which projects burn the most equivalent-API dollars, plus running today/month totals — handy for comparing project value.
 > `jsonl_costs.py` parses `~/.claude/projects/**/*.jsonl` (`iter_turns`) and aggregates into `by_project`, `by_session`, `today`, `this_month` (`build_report`). Day/month boundaries use your **local** timezone.
+> **De-duplication (important for accuracy):** Claude Code writes a separate JSONL line for every content block of an assistant message (thinking, text, and each `tool_use`), and they all carry the **same** `message.id`, `requestId`, and `usage` object. Counting every line over-counts cost massively — on real data ~62% of usage lines are such duplicates, inflating totals ~4–5×. `iter_turns` counts each `(message.id, requestId)` exactly once (same approach as `ccusage`). The de-dup set is global across files, which also collapses history duplicated into resumed/forked sessions.
 
 ### Two-tier cache pricing
 Cost estimates respect Anthropic's split cache-creation pricing, so the equivalent-$ figure is closer to reality.

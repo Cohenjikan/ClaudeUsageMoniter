@@ -142,9 +142,29 @@ def _parse_turn(obj: dict, fallback_session: str) -> TurnCost | None:
 
 
 def iter_turns(root: Path = PROJECTS_ROOT) -> Iterable[TurnCost]:
-    """Yield every billable TurnCost across all session files under root."""
+    """Yield each billable TurnCost once across all session files under root.
+
+    CRITICAL — de-duplication: Claude Code writes a SEPARATE JSONL line for
+    every content block of an assistant message (thinking, text, and each
+    tool_use), and EVERY one of those lines carries the *same* ``message.id``,
+    ``requestId``, and an identical ``usage`` object (usage is per-API-response,
+    not per-block). A single Opus turn with 4 tool calls therefore appears as
+    5 lines with identical usage. Summing every line over-counts cost massively
+    — on real data here, 62% of usage-bearing lines were such duplicates,
+    inflating the monthly total ~4.6x ($20k -> $4.5k).
+
+    The same ``(message.id, requestId)`` pair also reappears when session
+    history is copied into a resumed/forked/compacted session file, so the
+    de-dup set is kept GLOBAL across all files, not per-file.
+
+    We therefore count each ``(message.id, requestId)`` exactly once. This
+    matches how ccusage and other correct tools account for Claude Code usage.
+    Records with no ``message.id`` (shouldn't happen for assistant turns, but
+    just in case) are never dropped — they're treated as unique.
+    """
     if not root.exists():
         return
+    seen_keys: set[str] = set()
     for session_file in root.rglob("*.jsonl"):
         # Fallback session id from filename if record doesn't carry one.
         fallback_sid = session_file.stem
@@ -159,8 +179,18 @@ def iter_turns(root: Path = PROJECTS_ROOT) -> Iterable[TurnCost]:
                     except json.JSONDecodeError:
                         continue
                     turn = _parse_turn(obj, fallback_sid)
-                    if turn is not None:
-                        yield turn
+                    if turn is None:
+                        continue
+                    msg = obj.get("message") or {}
+                    mid = msg.get("id")
+                    if mid:
+                        # requestId lives at the top level of the record.
+                        rid = obj.get("requestId")
+                        key = f"{mid}:{rid}"
+                        if key in seen_keys:
+                            continue
+                        seen_keys.add(key)
+                    yield turn
         except (PermissionError, OSError):
             continue
 
