@@ -41,7 +41,7 @@ def _price_for_model(model: str) -> dict[str, float]:
 @dataclass
 class TurnCost:
     """Cost breakdown for one assistant message turn."""
-    timestamp: datetime           # When the message was generated (UTC).
+    timestamp: datetime | None    # When generated (UTC); None if the record's timestamp was unparseable.
     project_cwd: str              # Real working directory from the JSONL record.
     session_id: str
     model: str
@@ -80,6 +80,9 @@ class UsageReport:
     today: Aggregate = field(default_factory=Aggregate)
     this_month: Aggregate = field(default_factory=Aggregate)
     by_project: dict[str, Aggregate] = field(default_factory=lambda: defaultdict(Aggregate))
+    # Same shape as by_project but restricted to turns >= local month-start — this
+    # is what the floating window's "Top projects (this month)" panel needs.
+    by_project_month: dict[str, Aggregate] = field(default_factory=lambda: defaultdict(Aggregate))
     by_session: dict[str, Aggregate] = field(default_factory=lambda: defaultdict(Aggregate))
     last_session_id: str = ""     # Heuristic: the session-id of the most-recent turn we saw.
     last_session_at: datetime | None = None
@@ -120,12 +123,15 @@ def _parse_turn(obj: dict, fallback_session: str) -> TurnCost | None:
         + cache_1h * price["cache_1h"]
     ) / 1_000_000
 
-    # Timestamp — JSONL uses ISO 8601 with "Z" suffix.
+    # Timestamp — JSONL uses ISO 8601 with "Z" suffix. On parse failure we keep
+    # None rather than substituting now(): a bogus now() timestamp would silently
+    # pollute the today/this_month buckets (build_report skips None-ts turns from
+    # those buckets while still counting them toward all_time/by_project/by_session).
     ts_str = obj.get("timestamp") or ""
     try:
         ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
     except (ValueError, TypeError):
-        ts = datetime.now(timezone.utc)
+        ts = None
 
     return TurnCost(
         timestamp=ts,
@@ -139,6 +145,96 @@ def _parse_turn(obj: dict, fallback_session: str) -> TurnCost | None:
         cache_1h_tokens=cache_1h,
         cost_usd=cost,
     )
+
+
+# ---- Incremental per-file parse cache ----
+# build_report runs every JSONL_INTERVAL_SEC (30s) and the projects dir is ~150MB
+# across ~117 files; re-reading and re-parsing all of it each tick burned ~1s of
+# CPU under the GIL and contributed to UI stutter. Almost nothing changes between
+# ticks (one active session file grows, the rest are frozen history), so we cache
+# the parsed result of each file keyed by its (st_mtime_ns, st_size) and only
+# reparse files whose stat changed.
+#
+# Map: absolute path str -> (st_mtime_ns, st_size, {dedup_key: TurnCost}).
+# We deliberately store only the parsed TurnCosts (≈23k objects total after
+# dedup), never the raw lines, so memory stays bounded.
+_file_cache: dict[str, tuple[int, int, dict[str, "TurnCost"]]] = {}
+
+
+def _parse_file(path: Path) -> dict[str, TurnCost]:
+    """Parse one JSONL file into {dedup_key: TurnCost}, first-wins WITHIN the file.
+
+    Dedup key is ``f"{message.id}:{requestId}"`` for records that carry a
+    message.id (see the de-dup rationale below). Records lacking a message.id
+    get a per-file-unique key ``f"@{filename}:{line_no}"`` so they are NEVER
+    deduped (preserving the original never-drop-unkeyed behavior) and can never
+    collide with a real (message.id, requestId) key or with another file's keys.
+
+    Returns {} on any read error (matches the old per-file skip-on-error path).
+    """
+    fallback_sid = path.stem
+    fname = path.name
+    out: dict[str, TurnCost] = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line_no, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                turn = _parse_turn(obj, fallback_sid)
+                if turn is None:
+                    continue
+                msg = obj.get("message") or {}
+                mid = msg.get("id")
+                if mid:
+                    # requestId lives at the top level of the record.
+                    key = f"{mid}:{obj.get('requestId')}"
+                else:
+                    # Unkeyed record — never deduped, file-locally unique.
+                    key = f"@{fname}:{line_no}"
+                # First-wins within the file: identical (mid,rid) lines carry the
+                # same usage, so keeping the first is correct and stable.
+                if key not in out:
+                    out[key] = turn
+    except (PermissionError, OSError):
+        return {}
+    return out
+
+
+def _refresh_cache(root: Path) -> list[str]:
+    """Sync _file_cache with the current set of *.jsonl files under root.
+
+    Reuses cache entries whose (mtime_ns, size) are unchanged, reparses changed
+    or new files, and evicts entries for files that have disappeared. Returns the
+    sorted list of current absolute paths (the merge order build_report uses).
+    """
+    if not root.exists():
+        _file_cache.clear()
+        return []
+    current: list[str] = []
+    for session_file in sorted(root.rglob("*.jsonl")):
+        key = str(session_file)
+        current.append(key)
+        try:
+            st = session_file.stat()
+        except OSError:
+            # Vanished between rglob and stat — treat as absent.
+            current.pop()
+            continue
+        sig = (st.st_mtime_ns, st.st_size)
+        cached = _file_cache.get(key)
+        if cached is not None and (cached[0], cached[1]) == sig:
+            continue  # unchanged — reuse parsed turns
+        _file_cache[key] = (sig[0], sig[1], _parse_file(session_file))
+    # Evict files that no longer exist.
+    live = set(current)
+    for stale in [k for k in _file_cache if k not in live]:
+        del _file_cache[stale]
+    return current
 
 
 def iter_turns(root: Path = PROJECTS_ROOT) -> Iterable[TurnCost]:
@@ -157,42 +253,23 @@ def iter_turns(root: Path = PROJECTS_ROOT) -> Iterable[TurnCost]:
     history is copied into a resumed/forked/compacted session file, so the
     de-dup set is kept GLOBAL across all files, not per-file.
 
-    We therefore count each ``(message.id, requestId)`` exactly once. This
-    matches how ccusage and other correct tools account for Claude Code usage.
-    Records with no ``message.id`` (shouldn't happen for assistant turns, but
-    just in case) are never dropped — they're treated as unique.
+    We therefore count each ``(message.id, requestId)`` exactly once. Records
+    with no ``message.id`` are never dropped — they're treated as unique.
+
+    Now backed by the incremental per-file cache: yields turns in sorted-path
+    order, applying the global first-wins dedup across files.
     """
-    if not root.exists():
-        return
+    paths = _refresh_cache(root)
     seen_keys: set[str] = set()
-    for session_file in root.rglob("*.jsonl"):
-        # Fallback session id from filename if record doesn't carry one.
-        fallback_sid = session_file.stem
-        try:
-            with open(session_file, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    turn = _parse_turn(obj, fallback_sid)
-                    if turn is None:
-                        continue
-                    msg = obj.get("message") or {}
-                    mid = msg.get("id")
-                    if mid:
-                        # requestId lives at the top level of the record.
-                        rid = obj.get("requestId")
-                        key = f"{mid}:{rid}"
-                        if key in seen_keys:
-                            continue
-                        seen_keys.add(key)
-                    yield turn
-        except (PermissionError, OSError):
+    for key in paths:
+        entry = _file_cache.get(key)
+        if entry is None:
             continue
+        for dedup_key, turn in entry[2].items():
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
+            yield turn
 
 
 def build_report(root: Path = PROJECTS_ROOT, now: datetime | None = None) -> UsageReport:
@@ -202,6 +279,14 @@ def build_report(root: Path = PROJECTS_ROOT, now: datetime | None = None) -> Usa
     user thinks in local-calendar terms ("today's spend"), not in UTC days.
     JSONL timestamps come in as UTC-aware datetimes; Python compares aware
     datetimes by absolute moment, so the cross-tz comparison is correct.
+
+    Turns whose timestamp failed to parse (TurnCost.timestamp is None) still
+    count toward all_time / by_project / by_session, but are excluded from
+    today / this_month / by_project_month and from the last_session_at race,
+    so an unparseable timestamp can't pollute calendar-scoped totals.
+
+    Backed by the incremental per-file cache (see _refresh_cache / _parse_file):
+    only changed files are reparsed between calls.
     """
     if now is None:
         # `astimezone()` with no argument attaches the system's local tz to the
@@ -211,18 +296,31 @@ def build_report(root: Path = PROJECTS_ROOT, now: datetime | None = None) -> Usa
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
+    # Refresh the cache once, then merge globally first-wins in sorted-path order.
+    paths = _refresh_cache(root)
     rpt = UsageReport()
-    for turn in iter_turns(root):
-        rpt.all_time.add(turn)
-        if turn.timestamp >= today_start:
-            rpt.today.add(turn)
-        if turn.timestamp >= month_start:
-            rpt.this_month.add(turn)
-        rpt.by_project[turn.project_cwd or "<unknown>"].add(turn)
-        rpt.by_session[turn.session_id].add(turn)
-        if rpt.last_session_at is None or turn.timestamp > rpt.last_session_at:
-            rpt.last_session_at = turn.timestamp
-            rpt.last_session_id = turn.session_id
+    seen_keys: set[str] = set()
+    for key in paths:
+        entry = _file_cache.get(key)
+        if entry is None:
+            continue
+        for dedup_key, turn in entry[2].items():
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
+            rpt.all_time.add(turn)
+            rpt.by_project[turn.project_cwd or "<unknown>"].add(turn)
+            rpt.by_session[turn.session_id].add(turn)
+            ts = turn.timestamp
+            if ts is not None:
+                if ts >= today_start:
+                    rpt.today.add(turn)
+                if ts >= month_start:
+                    rpt.this_month.add(turn)
+                    rpt.by_project_month[turn.project_cwd or "<unknown>"].add(turn)
+                if rpt.last_session_at is None or ts > rpt.last_session_at:
+                    rpt.last_session_at = ts
+                    rpt.last_session_id = turn.session_id
 
     return rpt
 

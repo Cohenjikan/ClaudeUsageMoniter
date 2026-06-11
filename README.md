@@ -88,15 +88,19 @@ Click the strip or tray for a dark card with quota bars, reset countdowns, cost 
 
 ![The dark floating detail window: color-coded 5h and 7-day quota bars, live reset countdowns, session/today/month cost, and a top-projects list (demo data)](screenshots/window.png)
 
-> `FloatingWindow` (`app.py:321+`) renders color-coded 5h/7d bars, live "resets in Xm" countdowns (repaints every 1 s), session/today/month costs, and up to 6 top-project rows. Hidden by default.
+> `FloatingWindow` renders color-coded 5h/7d bars (with per-model Opus/Sonnet sub-bars when present), absolute reset times with live countdowns (repaints every 1 s), session/today/month costs, and up to 6 top-project rows. The projects panel is **scoped to the current month** (`by_project_month`). Hidden by default.
 
 ### Tray icon shows live 5h%
 Even with no windows open, the system-tray badge tells you your 5-hour usage at a glance, color-coded by severity.
 > `render_tray_icon` (`app.py:282`) draws the integer 5h% on a rounded rect colored by `color_for_pct` (green / orange / red), updated on every state change.
 
-### Bilingual UI and configurable strip layout
-Switch between English and Chinese, and choose how much detail the strip shows — all from the tray menu.
-> `LANGUAGES` holds `en` and `zh` dicts; the tray Settings submenu offers a language picker and four display modes (compact / +time-remaining / +time-remaining% / +time-elapsed%).
+### Bilingual UI and a real Settings window
+Switch between English and Chinese, toggle autostart, and choose strip side / opacity / display mode — all from one **tray → Settings** window (General / Strip / About), not buried tray submenus.
+> `LANGUAGES` holds `en` and `zh` dicts driving every visible string; `SettingsWindow` (`app.py`) is a dark-themed `Toplevel` with a custom segmented tab bar. It offers the language picker, the **Run at startup** checkbox, strip side (left/right), opaque background, and four display modes (compact / +time-remaining / +time-remaining% / +time-elapsed%). Live changes apply immediately and persist to `config.json`.
+
+### Boots instantly, runs once
+The window shows your last-known quota the moment it opens — even before the first network call — and only one copy ever runs.
+> A single-instance named mutex makes a second launch exit quietly (`main()`). The last good snapshot is cached to `usage_cache.json` and seeded on startup, with a fast-retry ladder so fresh numbers land quickly once connectivity (or a token refresh) clears.
 
 ---
 
@@ -120,7 +124,9 @@ That's it. A tray icon appears with your live 5h%, and the strip pins to your ta
 
 ### Optional: launch at startup
 
-Create a shortcut in your Startup folder (`Win+R` → `shell:startup`) pointing to:
+Easiest way: open **tray → Settings → General** and tick **Run at startup**. It creates (and removes) the Startup-folder shortcut for you, using `pythonw.exe` so no console window flashes on boot. If an autostart launcher for this app already exists, the checkbox detects it and reflects its state.
+
+Manual alternative — create a shortcut in your Startup folder (`Win+R` → `shell:startup`) pointing to:
 
 ```
 Target:    "<python_install>\pythonw.exe" "D:\Apps\cc-usage-tray\app.py"
@@ -221,7 +227,7 @@ STRIP_SIDE_MARGIN = 12            # gap from chosen edge
 STRIP_GAP_FROM_TASKBAR = 0        # gap between strip bottom and taskbar top
 ```
 
-Per-user strip state (position, display mode, language, opaque-background toggle) lives in a `config.json` next to the script — set it by dragging and via the tray menu. The file is per-user and git-ignored, so a fresh clone has none until you create one; delete it or use **Reset strip position** to snap back to defaults.
+Per-user state (strip position, side, display mode, opaque-background toggle, and language) lives in a `config.json` next to the script — set it by dragging and via **tray → Settings**. The file is per-user and git-ignored, so a fresh clone has none until you create one; delete it or use **Reset position** (Settings → Strip) to snap back to defaults.
 
 The pricing table is `jsonl_costs.py:PRICING` — update it when Anthropic adjusts rates or ships new model families.
 

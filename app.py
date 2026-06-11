@@ -9,10 +9,12 @@ import ctypes
 import json
 import logging
 import os
+import subprocess
 import sys
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
+import webbrowser
 from ctypes import wintypes
 from pathlib import Path
 
@@ -32,6 +34,11 @@ from jsonl_costs import Aggregate
 from state import Orchestrator
 from usage_api import UsageSnapshot
 
+__version__ = "0.3.0"
+
+# Project home page — shown/opened from the Settings → General tab.
+PROJECT_URL = "https://github.com/Cohenjikan/ClaudeUsageMoniter"
+
 # ---- i18n ----
 # Module-level current-language state. set_app_language() rebinds it; t() looks
 # it up. Menu items use callable `text=` so they re-evaluate t() every time the
@@ -39,45 +46,141 @@ from usage_api import UsageSnapshot
 # no menu rebuild. Strip text picks up the new language on its next render tick.
 LANGUAGES: dict[str, dict[str, str]] = {
     "en": {
+        # ---- Tray + strip menus ----
         "show_window": "Show window",
         "refresh_now": "Refresh now",
-        "settings": "Settings",
+        "settings": "Settings…",
         "show_strip": "Show taskbar strip",
-        "always_on_top": "Always on top (window)",
-        "opaque_bg": "Strip: opaque background",
-        "move_strip": "Move strip (drag with mouse)",
-        "reset_strip_position": "Reset strip position",
+        "hide_strip": "Hide taskbar strip",
         "display_mode": "Display mode",
         "mode_1": "Compact (quota only)",
         "mode_2": "+ Time remaining",
         "mode_3": "+ Time-remaining %",
         "mode_4": "+ Time-elapsed %",
-        "language": "Language",
         "quit": "Quit",
-        # Strip labels
+        # ---- Short labels (shared strip + window; intentionally untranslated) ----
         "5h": "5h",
         "7d": "7d",
         "today": "today",
+        # ---- Floating window section headers / labels ----
+        "win_title": "Claude Usage",
+        "lbl_5h_window": "5h window",
+        "lbl_weekly": "Weekly",
+        "lbl_session": "Session",
+        "lbl_today": "Today",
+        "lbl_this_month": "This month",
+        "projects_header": "Top projects (this month)",
+        "cost_caption": "Equivalent API cost — Claude Code only",
+        "loading": "loading…",
+        "idle_full": "idle (full quota)",
+        "opus": "Opus",
+        "sonnet": "Sonnet",
+        # Captions with runtime values are built via helpers, but the static
+        # fragments live here so they translate.
+        "resets_at": "resets at {time} · {left} left",  # {time}=HH:MM, {left}=2h 13m
+        "updated_ago": "updated {age} ago",
+        # ---- Settings window ----
+        "settings_title": "Settings",
+        "tab_general": "General",
+        "tab_strip": "Strip",
+        "tab_about": "About",
+        "language": "Language",
+        "lang_en": "English",
+        "lang_zh": "中文",
+        "run_at_startup": "Run at startup",
+        "version_label": "Version",
+        "project_page": "Project page",
+        "strip_show": "Show taskbar strip",
+        "strip_opaque_bg": "Opaque background",
+        "strip_screen_pos": "Screen position",
+        "pos_left": "Left",
+        "pos_right": "Right",
+        "strip_display_mode": "Display mode",
+        "strip_drag_toggle": "Drag mode",
+        "strip_drag_on": "Drag mode: ON (drag the strip)",
+        "strip_drag_off": "Drag mode: OFF",
+        "strip_reset_pos": "Reset position",
+        "about_blurb": (
+            "5h / 7d % are server-side and include ALL usage — chat plus code.\n\n"
+            "$ values come only from local Claude Code transcripts: an equivalent "
+            "API value, excluding chat.\n\n"
+            "Polling cadence: 6 min for the API, 30 s for local JSONL.\n\n"
+            "MIT license."
+        ),
+        # ---- Toast notifications ----
+        "toast_5h_window": "5-hour window",
+        "toast_weekly": "Weekly quota",
+        "toast_title": "Claude {window} at {pct}%",
+        "toast_body_default": "Heads up — you may want to slow down or switch projects.",
+        "toast_body_90": "Approaching the limit. Plan accordingly.",
+        "toast_body_95": "Very close to the limit. Stop or you'll get rate-limited.",
     },
     "zh": {
+        # ---- Tray + strip menus ----
         "show_window": "显示窗口",
         "refresh_now": "立即刷新",
-        "settings": "设置",
-        "show_strip": "显示底部状态条",
-        "always_on_top": "窗口置顶",
-        "opaque_bg": "状态条不透明背景",
-        "move_strip": "拖动状态条",
-        "reset_strip_position": "重置状态条位置",
+        "settings": "设置…",
+        "show_strip": "显示状态条",
+        "hide_strip": "隐藏状态条",
         "display_mode": "显示模式",
         "mode_1": "简洁 (仅额度)",
         "mode_2": "+ 剩余时间",
         "mode_3": "+ 剩余时间百分比",
         "mode_4": "+ 已用时间百分比",
-        "language": "语言",
         "quit": "退出",
+        # ---- Short labels ----
         "5h": "5h",
         "7d": "7d",
         "today": "今日",
+        # ---- Floating window section headers / labels ----
+        "win_title": "Claude 用量",
+        "lbl_5h_window": "5h 窗口",
+        "lbl_weekly": "周配额",
+        "lbl_session": "本次会话",
+        "lbl_today": "今日",
+        "lbl_this_month": "本月",
+        "projects_header": "本月项目 Top 6",
+        "cost_caption": "等效 API 成本（仅 Claude Code）",
+        "loading": "加载中…",
+        "idle_full": "空闲 · 满额可用",
+        "opus": "Opus",
+        "sonnet": "Sonnet",
+        "resets_at": "{time} 重置 · 剩 {left}",
+        "updated_ago": "{age}前更新",
+        # ---- Settings window ----
+        "settings_title": "设置",
+        "tab_general": "常规",
+        "tab_strip": "状态条",
+        "tab_about": "关于",
+        "language": "语言",
+        "lang_en": "English",
+        "lang_zh": "中文",
+        "run_at_startup": "开机自启",
+        "version_label": "版本",
+        "project_page": "项目主页",
+        "strip_show": "显示状态条",
+        "strip_opaque_bg": "不透明背景",
+        "strip_screen_pos": "屏幕位置",
+        "pos_left": "左",
+        "pos_right": "右",
+        "strip_display_mode": "显示模式",
+        "strip_drag_toggle": "拖动模式",
+        "strip_drag_on": "拖动模式：开（拖动状态条）",
+        "strip_drag_off": "拖动模式：关",
+        "strip_reset_pos": "重置位置",
+        "about_blurb": (
+            "5h / 7d 百分比来自服务端，涵盖全部用量——chat 加 code。\n\n"
+            "$ 金额仅来自本地 Claude Code 会话记录：等效 API 价值，不含 chat。\n\n"
+            "轮询节奏：API 每 6 分钟，本地 JSONL 每 30 秒。\n\n"
+            "MIT 许可证。"
+        ),
+        # ---- Toast notifications ----
+        "toast_5h_window": "5 小时窗口",
+        "toast_weekly": "每周配额",
+        "toast_title": "Claude {window} 已达 {pct}%",
+        "toast_body_default": "提醒——你可能需要放慢节奏或切换项目。",
+        "toast_body_90": "正在逼近上限，请合理安排。",
+        "toast_body_95": "非常接近上限，再用就会被限流。",
     },
 }
 
@@ -107,8 +210,10 @@ ACCENT = "#7c5cff"      # purple (matches Claude branding)
 WARN = "#ffa657"        # orange
 DANGER = "#ff5e5e"      # red
 OK = "#3ddc97"          # green
+BORDER = "#3a3c41"      # 1px card border + progress-bar track
 
-WINDOW_W, WINDOW_H = 340, 460
+WINDOW_W, WINDOW_H = 360, 520   # nominal; height packs to content (see FloatingWindow)
+WINDOW_MIN_H = 320
 TRAY_ICON_SIZE = 64     # internal render size; Windows downsamples to taskbar size
 
 # Sentinel "transparent color" for the strip's window — any pixel matching this
@@ -178,6 +283,146 @@ def set_app_language(lang: str) -> None:
     save_config(cfg)
 
 
+# ---- Run-at-startup (Windows Startup-folder shortcut) ----
+# We manage a single canonical .lnk in the per-user Startup folder. Detection
+# also recognizes any pre-existing user-made launcher (.lnk / .bat / .cmd / .vbs)
+# that references this app.py, so the checkbox reflects an autostart the user set
+# up manually and unchecking removes whichever file we found.
+APP_PY = Path(__file__).resolve()
+APP_DIR = APP_PY.parent
+STARTUP_SHORTCUT_NAME = "ClaudeUsageMonitor.lnk"
+# CreateProcess flag to suppress the brief console window when we shell out to
+# PowerShell for shortcut COM operations.
+_CREATE_NO_WINDOW = 0x08000000
+
+
+def startup_dir() -> Path:
+    """The per-user Windows Startup folder (where shortcuts auto-run at login)."""
+    return (Path(os.environ.get("APPDATA", ""))
+            / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup")
+
+
+def pythonw_path() -> str:
+    """Path to pythonw.exe next to the running interpreter (console-less), or
+    sys.executable if pythonw isn't found alongside it."""
+    cand = Path(sys.executable).with_name("pythonw.exe")
+    return str(cand) if cand.is_file() else sys.executable
+
+
+def _run_powershell(script: str) -> str | None:
+    """Run a PowerShell snippet with no console flash; return stdout (stripped)
+    or None on failure. Never raises."""
+    try:
+        proc = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=15,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        logging.getLogger(__name__).warning("powershell call failed: %s", e)
+        return None
+    if proc.returncode != 0:
+        logging.getLogger(__name__).warning(
+            "powershell returned %d: %s", proc.returncode, proc.stderr.strip())
+        return None
+    return proc.stdout.strip()
+
+
+def _read_shortcut_target(lnk: Path) -> str:
+    """Read a .lnk's TargetPath + Arguments via WScript.Shell COM, returned as
+    one lowercase string for substring matching. '' on any failure."""
+    script = (
+        "$s=New-Object -ComObject WScript.Shell;"
+        f"$sc=$s.CreateShortcut('{lnk}');"
+        "Write-Output $sc.TargetPath;Write-Output $sc.Arguments"
+    )
+    out = _run_powershell(script)
+    return (out or "").lower()
+
+
+def find_autostart_entry(directory: Path | None = None) -> Path | None:
+    """Return the Startup file that launches this app, or None.
+
+    Resolution order:
+      1. Our canonical shortcut (STARTUP_SHORTCUT_NAME) if it exists.
+      2. Any *.lnk whose target/arguments reference this app.py.
+      3. Any *.bat / *.cmd / *.vbs whose text references this app.py.
+
+    `directory` defaults to the real Startup folder; tests pass a temp dir.
+    """
+    directory = directory or startup_dir()
+    canonical = directory / STARTUP_SHORTCUT_NAME
+    if canonical.exists():
+        return canonical
+    if not directory.is_dir():
+        return None
+    needle = str(APP_PY).lower()
+    # Also match a forward-slash spelling some launchers use on Windows.
+    needle_alt = needle.replace("\\", "/")
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError:
+        return None
+    for f in entries:
+        suffix = f.suffix.lower()
+        if suffix == ".lnk":
+            hay = _read_shortcut_target(f)
+            if needle in hay or needle_alt in hay:
+                return f
+        elif suffix in (".bat", ".cmd", ".vbs"):
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace").lower()
+            except OSError:
+                continue
+            if needle in text or needle_alt in text:
+                return f
+    return None
+
+
+def is_autostart_enabled(directory: Path | None = None) -> bool:
+    return find_autostart_entry(directory) is not None
+
+
+def create_autostart_entry(directory: Path | None = None) -> Path | None:
+    """Create the canonical Startup shortcut launching this app via pythonw.exe.
+    Returns the shortcut Path on success, None on failure (logged, never raises)."""
+    directory = directory or startup_dir()
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logging.getLogger(__name__).warning("cannot create startup dir: %s", e)
+        return None
+    lnk = directory / STARTUP_SHORTCUT_NAME
+    target = pythonw_path()
+    script = (
+        "$s=New-Object -ComObject WScript.Shell;"
+        f"$sc=$s.CreateShortcut('{lnk}');"
+        f"$sc.TargetPath='{target}';"
+        f"$sc.Arguments='\"{APP_PY}\"';"
+        f"$sc.WorkingDirectory='{APP_DIR}';"
+        "$sc.Save()"
+    )
+    out = _run_powershell(script)
+    if out is None or not lnk.exists():
+        logging.getLogger(__name__).warning("failed to create startup shortcut")
+        return None
+    return lnk
+
+
+def remove_autostart_entry(directory: Path | None = None) -> bool:
+    """Delete whichever Startup launcher references this app. True if removed (or
+    none existed), False on a delete error."""
+    entry = find_autostart_entry(directory)
+    if entry is None:
+        return True
+    try:
+        entry.unlink()
+        return True
+    except OSError as e:
+        logging.getLogger(__name__).warning("failed to remove startup entry: %s", e)
+        return False
+
+
 # ---- Win32 helpers for taskbar position detection + z-order recovery ----
 _SPI_GETWORKAREA = 0x0030
 # GetAncestor(hwnd, GA_ROOT) → top-level root of the given window. Used to
@@ -213,6 +458,20 @@ _user32.SystemParametersInfoW.argtypes = [
     wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT,
 ]
 _user32.SystemParametersInfoW.restype = wintypes.BOOL
+
+# kernel32 for the single-instance named mutex (see main()). CreateMutexW takes a
+# LPSECURITY_ATTRIBUTES (NULL here), a BOOL initial-owner, and the name; the HANDLE
+# return is irrelevant — we only care whether GetLastError() reports the name
+# already existed. Typed so the HANDLE isn't truncated on 64-bit Windows.
+_kernel32 = ctypes.windll.kernel32
+_kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+_kernel32.CreateMutexW.restype = wintypes.HANDLE
+_kernel32.GetLastError.argtypes = []
+_kernel32.GetLastError.restype = wintypes.DWORD
+
+# Returned by GetLastError() after CreateMutexW when a mutex with the same name
+# already exists (i.e. another instance of us is already running).
+_ERROR_ALREADY_EXISTS = 183
 
 
 def get_taskbar_top_logical(fallback_screen_h: int) -> int:
@@ -279,18 +538,27 @@ def color_for_pct(pct: float) -> str:
     return ACCENT
 
 
-def render_tray_icon(pct: float) -> Image.Image:
-    """Render the tray icon: rounded rect with the 5h percentage as big text."""
+# Neutral gray for the "unknown" tray badge — shown before the first successful
+# fetch (and from any state where we genuinely have no percentage to display).
+TRAY_UNKNOWN_BG = "#5a5d63"
+
+
+def render_tray_icon(pct: float | None) -> Image.Image:
+    """Render the tray icon: rounded rect with the 5h percentage as big text.
+
+    pct=None renders a "?" on a neutral gray rect — the honest "no data yet"
+    state, used until the first snapshot lands instead of a misleading "0".
+    """
     size = TRAY_ICON_SIZE
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    color = color_for_pct(pct)
+    color = TRAY_UNKNOWN_BG if pct is None else color_for_pct(pct)
     # Background rounded rect
     draw.rounded_rectangle((2, 2, size - 2, size - 2), radius=14, fill=color)
 
-    # Text: e.g. "33" or "100"
-    text = f"{int(pct)}"
+    # Text: e.g. "33" or "100", or "?" when unknown.
+    text = "?" if pct is None else f"{int(pct)}"
     # pick a font size that fits — 3-digit numbers get smaller text
     font_size = 30 if len(text) <= 2 else 24
     try:
@@ -318,108 +586,236 @@ def fmt_minutes(m: int) -> str:
     return f"{d}d {hh}h"
 
 
+def fmt_age(seconds: int) -> str:
+    """Format a freshness age (seconds since last fetch) compactly:
+    '12s' / '3m' / '2h 05m'. Used by the floating window footer."""
+    if seconds < 60:
+        return f"{seconds}s"
+    m, _s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m"
+    h, mm = divmod(m, 60)
+    return f"{h}h {mm:02d}m"
+
+
+def fmt_reset_clock(iso_ts: str) -> str:
+    """Return the local wall-clock 'HH:MM' for an ISO 8601 reset timestamp, or
+    '' if it can't be parsed. Used for the absolute-time reset caption."""
+    from datetime import datetime
+    if not iso_ts:
+        return ""
+    try:
+        target = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return ""
+    # fromisoformat yields an aware datetime; astimezone() with no arg converts
+    # to the system local timezone for display.
+    return target.astimezone().strftime("%H:%M")
+
+
+def _truncate_project(cwd: str, max_len: int = 40) -> tuple[str, str]:
+    """Split a project working dir into (basename, dimmed-parent) for display.
+
+    The basename (last path component) is shown at full strength; the parent
+    path is dimmed and middle-truncated so long paths stay one line without
+    losing the meaningful head and tail. Returns ("", "") for an empty cwd.
+    """
+    if not cwd:
+        return ("", "")
+    norm = cwd.replace("\\", "/").rstrip("/")
+    base = norm.rsplit("/", 1)[-1] if "/" in norm else norm
+    parent = norm[: len(norm) - len(base)].rstrip("/")
+    if parent and len(parent) > max_len:
+        head = max_len // 2 - 1
+        tail = max_len - head - 1
+        parent = parent[:head] + "…" + parent[-tail:]
+    return (base, parent)
+
+
 class FloatingWindow:
-    """The tkinter floating-card window. Hidden by default; tray toggles visibility."""
+    """The tkinter floating-card window. Hidden by default; tray toggles visibility.
+
+    Layout (top→bottom): header, quota card, cost card, projects card, footer.
+    All per-tick updates go through .config() on PRE-CREATED widgets so the
+    window never flickers; the small Canvas bars cache their last drawn value
+    and skip redrawing when it's unchanged.
+    """
+
+    PROJ_ROWS_MAX = 6
 
     def __init__(self, orch: Orchestrator, on_close: callable) -> None:
         self.orch = orch
         self.on_close = on_close
         self.root = tk.Tk()
-        self.root.title("Claude Usage")
+        self.root.title(t("win_title"))
         self.root.configure(bg=BG)
         self.root.geometry(f"{WINDOW_W}x{WINDOW_H}+200+200")
         self.root.attributes("-topmost", True)     # always on top by default
-        self.root.minsize(WINDOW_W, 200)
+        # Let height pack to content; only constrain the minimum so the window
+        # can't collapse. Width is fixed.
+        self.root.minsize(WINDOW_W, WINDOW_MIN_H)
+        self.root.resizable(False, False)
         # Closing the X button just hides — quitting is via tray.
         self.root.protocol("WM_DELETE_WINDOW", self.hide)
         # Start hidden until the user explicitly shows from tray.
         self.root.withdraw()
 
+        # Per-bar last-drawn cache: (value_pct_rounded, width) → skip identical
+        # redraws. Keyed by a bar id ("5h", "7d", "opus_7d", "sonnet_7d",
+        # "proj0".."proj5").
+        self._bar_cache: dict[str, tuple] = {}
+
         self._build()
         # Periodically repaint with the latest snapshot from orchestrator.
         self._tick()
 
+    # ---- construction helpers ----
+
+    def _card(self, pad: int) -> tk.Frame:
+        """A bordered PANEL card (1px BORDER outline via highlight*)."""
+        card = tk.Frame(self.root, bg=PANEL,
+                        highlightbackground=BORDER, highlightthickness=1, bd=0)
+        card.pack(fill="x", padx=pad, pady=4)
+        return card
+
+    def _hoverable(self, widget: tk.Widget, normal_fg: str, hover_fg: str) -> None:
+        """Bind <Enter>/<Leave> so a header button brightens on hover."""
+        widget.bind("<Enter>", lambda _e: widget.config(fg=hover_fg))
+        widget.bind("<Leave>", lambda _e: widget.config(fg=normal_fg))
+
     def _build(self) -> None:
         pad = 14
-        # Header
+
+        # --- Header ---
         header = tk.Frame(self.root, bg=BG)
         header.pack(fill="x", padx=pad, pady=(pad, 6))
-        tk.Label(header, text="Claude Usage", bg=BG, fg=FG,
+        tk.Label(header, text=t("win_title"), bg=BG, fg=FG,
                  font=("Segoe UI Semibold", 13)).pack(side="left")
         self.refresh_btn = tk.Button(
             header, text="↻", bg=BG, fg=FG_DIM, bd=0, font=("Segoe UI", 11),
-            activebackground=PANEL, activeforeground=FG,
+            activebackground=BG, activeforeground=FG,
             command=self._refresh_clicked, cursor="hand2",
         )
         self.refresh_btn.pack(side="right", padx=4)
+        self._hoverable(self.refresh_btn, FG_DIM, ACCENT)
         self.topmost_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(
+        self.pin_btn = tk.Checkbutton(
             header, text="📌", variable=self.topmost_var, bg=BG, fg=FG_DIM,
             selectcolor=BG, activebackground=BG, activeforeground=FG,
             bd=0, font=("Segoe UI", 10), command=self._toggle_topmost,
-        ).pack(side="right", padx=2)
+            cursor="hand2",
+        )
+        self.pin_btn.pack(side="right", padx=2)
+        self._hoverable(self.pin_btn, FG_DIM, ACCENT)
 
-        # Quota section (5h + 7d)
-        self.quota_frame = tk.Frame(self.root, bg=PANEL)
-        self.quota_frame.pack(fill="x", padx=pad, pady=4)
-        self.quota_widgets = {}
-        for key, label in (("5h", "5h window"), ("7d", "Weekly")):
-            row = tk.Frame(self.quota_frame, bg=PANEL)
-            row.pack(fill="x", padx=10, pady=8)
-            tk.Label(row, text=label, bg=PANEL, fg=FG_DIM,
-                     font=("Segoe UI", 9), width=10, anchor="w").pack(side="left")
+        # --- Quota card (5h + 7d) ---
+        quota = self._card(pad)
+        self.quota_widgets: dict[str, tuple] = {}
+        for key, label_key in (("5h", "lbl_5h_window"), ("7d", "lbl_weekly")):
+            row = tk.Frame(quota, bg=PANEL)
+            row.pack(fill="x", padx=10, pady=(8, 0))
+            lbl = tk.Label(row, text=t(label_key), bg=PANEL, fg=FG_DIM,
+                           font=("Segoe UI", 9), anchor="w")
+            lbl.pack(side="left")
             pct_lbl = tk.Label(row, text="—", bg=PANEL, fg=FG,
-                               font=("Segoe UI Semibold", 11), width=6, anchor="e")
+                               font=("Segoe UI Semibold", 16), anchor="e")
             pct_lbl.pack(side="right")
-            reset_lbl = tk.Label(row, text="", bg=PANEL, fg=FG_DIM,
-                                 font=("Segoe UI", 8), anchor="e")
-            reset_lbl.pack(side="right", padx=(0, 8))
-            bar_canvas = tk.Canvas(self.quota_frame, height=6, bg=PANEL,
-                                   highlightthickness=0)
-            bar_canvas.pack(fill="x", padx=10, pady=(0, 4))
-            self.quota_widgets[key] = (pct_lbl, reset_lbl, bar_canvas)
+            bar_canvas = tk.Canvas(quota, height=8, bg=PANEL,
+                                   highlightthickness=0, bd=0)
+            bar_canvas.pack(fill="x", padx=10, pady=(2, 0))
+            caption = tk.Label(quota, text="", bg=PANEL, fg=FG_DIM,
+                               font=("Segoe UI", 8), anchor="w")
+            caption.pack(fill="x", padx=10, pady=(1, 6))
+            # The label is pre-created and updated in _render so a language
+            # switch reflects on the next tick.
+            self.quota_widgets[key] = {
+                "label": lbl, "label_key": label_key,
+                "pct": pct_lbl, "bar": bar_canvas, "caption": caption,
+            }
 
-        # Cost section
-        self.cost_frame = tk.Frame(self.root, bg=PANEL)
-        self.cost_frame.pack(fill="x", padx=pad, pady=4)
-        self.cost_labels = {}
-        for key, label in (("session", "Session"), ("today", "Today"), ("month", "This month")):
-            row = tk.Frame(self.cost_frame, bg=PANEL)
-            row.pack(fill="x", padx=10, pady=4)
-            tk.Label(row, text=label, bg=PANEL, fg=FG_DIM,
-                     font=("Segoe UI", 9), anchor="w").pack(side="left")
-            val = tk.Label(row, text="—", bg=PANEL, fg=FG,
-                           font=("Segoe UI Semibold", 10), anchor="e")
+        # 7d Opus/Sonnet sub-rows (slim mini-bars). Pre-created; shown only when
+        # the snapshot carries per-model percentages.
+        self.subrows: dict[str, dict] = {}
+        for sub_key, label_key in (("opus", "opus"), ("sonnet", "sonnet")):
+            sub = tk.Frame(quota, bg=PANEL)
+            slbl = tk.Label(sub, text=t(label_key), bg=PANEL, fg=FG_DIM,
+                            font=("Segoe UI", 8), width=6, anchor="w")
+            slbl.pack(side="left")
+            spct = tk.Label(sub, text="", bg=PANEL, fg=FG_DIM,
+                            font=("Segoe UI", 8), width=5, anchor="e")
+            spct.pack(side="right")
+            sbar = tk.Canvas(sub, height=4, bg=PANEL, highlightthickness=0, bd=0)
+            sbar.pack(side="left", fill="x", expand=True, padx=(6, 6))
+            self.subrows[sub_key] = {
+                "frame": sub, "label": slbl, "label_key": label_key,
+                "pct": spct, "bar": sbar,
+            }
+        # Spacer under the sub-rows so they don't crowd the card edge.
+        self._quota_bottom_pad = tk.Frame(quota, bg=PANEL, height=4)
+
+        # --- Cost card ---
+        cost = self._card(pad)
+        self.cost_caption = tk.Label(cost, text=t("cost_caption"), bg=PANEL,
+                                     fg=FG_DIM, font=("Segoe UI", 8), anchor="w")
+        self.cost_caption.pack(fill="x", padx=10, pady=(6, 2))
+        self.cost_labels: dict[str, tk.Label] = {}
+        for key, label_key, emphasized in (
+            ("session", "lbl_session", False),
+            ("today", "lbl_today", True),
+            ("month", "lbl_this_month", False),
+        ):
+            row = tk.Frame(cost, bg=PANEL)
+            row.pack(fill="x", padx=10, pady=2)
+            name_font = ("Segoe UI Semibold", 11) if emphasized else ("Segoe UI", 10)
+            name_fg = FG if emphasized else FG_DIM
+            nm = tk.Label(row, text=t(label_key), bg=PANEL, fg=name_fg,
+                          font=name_font, anchor="w")
+            nm.pack(side="left")
+            val_font = ("Segoe UI Semibold", 11) if emphasized else ("Segoe UI", 10)
+            val = tk.Label(row, text="—", bg=PANEL, fg=FG, font=val_font, anchor="e")
             val.pack(side="right")
             self.cost_labels[key] = val
+            # Keep a handle to the name label for i18n refresh.
+            self.cost_labels[key + "_name"] = nm
+            self.cost_labels[key + "_name_key"] = label_key  # type: ignore[assignment]
+        # bottom pad
+        tk.Frame(cost, bg=PANEL, height=4).pack()
 
-        # Projects section
+        # --- Projects card ---
         proj_header = tk.Frame(self.root, bg=BG)
         proj_header.pack(fill="x", padx=pad, pady=(8, 2))
-        tk.Label(proj_header, text="Top projects (this month)", bg=BG, fg=FG_DIM,
-                 font=("Segoe UI", 9)).pack(side="left")
+        self.proj_header_lbl = tk.Label(proj_header, text=t("projects_header"),
+                                        bg=BG, fg=FG_DIM, font=("Segoe UI", 9))
+        self.proj_header_lbl.pack(side="left")
 
-        self.proj_frame = tk.Frame(self.root, bg=PANEL)
-        self.proj_frame.pack(fill="both", expand=True, padx=pad, pady=(0, pad))
-        # Pre-create N fixed project rows; _render only updates label text and
-        # pack_forgets unused rows. Destroying+recreating widgets every tick
-        # would make the window visibly flicker.
-        self.PROJ_ROWS_MAX = 6
-        self.proj_rows: list[tuple[tk.Frame, tk.Label, tk.Label]] = []
+        proj_card = self._card(pad)
+        # Pre-create N fixed project rows (label row + proportional bar). _render
+        # only updates text/bars and pack_forgets unused rows — no destroy/create.
+        self.proj_rows: list[dict] = []
         for _ in range(self.PROJ_ROWS_MAX):
-            row = tk.Frame(self.proj_frame, bg=PANEL)
-            path_lbl = tk.Label(row, text="", bg=PANEL, fg=FG,
+            container = tk.Frame(proj_card, bg=PANEL)
+            row = tk.Frame(container, bg=PANEL)
+            row.pack(fill="x", padx=10, pady=(4, 0))
+            base_lbl = tk.Label(row, text="", bg=PANEL, fg=FG,
                                 font=("Segoe UI", 9), anchor="w")
-            path_lbl.pack(side="left", fill="x", expand=True)
+            base_lbl.pack(side="left")
+            parent_lbl = tk.Label(row, text="", bg=PANEL, fg=FG_DIM,
+                                  font=("Segoe UI", 8), anchor="w")
+            parent_lbl.pack(side="left", padx=(4, 0))
             cost_lbl = tk.Label(row, text="", bg=PANEL, fg=FG_DIM,
                                 font=("Segoe UI", 9), anchor="e")
             cost_lbl.pack(side="right")
-            self.proj_rows.append((row, path_lbl, cost_lbl))
+            bar = tk.Canvas(container, height=2, bg=PANEL, highlightthickness=0, bd=0)
+            bar.pack(fill="x", padx=10, pady=(1, 3))
+            self.proj_rows.append({
+                "container": container, "base": base_lbl,
+                "parent": parent_lbl, "cost": cost_lbl, "bar": bar,
+            })
 
-        # Footer (last-update timestamps + error indicator)
+        # --- Footer (freshness / error) ---
         self.footer = tk.Label(self.root, text="", bg=BG, fg=FG_DIM,
                                font=("Segoe UI", 8))
-        self.footer.pack(side="bottom", anchor="e", padx=pad, pady=(0, 6))
+        self.footer.pack(side="bottom", anchor="e", padx=pad, pady=(2, 8))
 
     def _refresh_clicked(self) -> None:
         self.orch.refresh_now()
@@ -428,6 +824,9 @@ class FloatingWindow:
         self.root.attributes("-topmost", bool(self.topmost_var.get()))
 
     def show(self) -> None:
+        # Refresh the title here (cheap, and the only moment it's visible) so a
+        # language switch made while hidden is reflected when the window opens.
+        self.root.title(t("win_title"))
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
@@ -446,70 +845,129 @@ class FloatingWindow:
         # Repaint every second so the "resets in Xm" countdown updates live.
         self.root.after(1000, self._tick)
 
+    # ---- per-tick bar drawing with last-value cache ----
+
+    def _draw_bar(self, bar_id: str, canvas: tk.Canvas, pct: float, color: str,
+                  height: int) -> None:
+        """Draw a horizontal progress bar (track + fill), skipping the redraw
+        when neither the rounded percent nor the canvas width changed since the
+        last call for this bar_id. Avoids per-tick flicker on static values."""
+        w = canvas.winfo_width() or (WINDOW_W - 2 * 14 - 20)
+        key = (round(pct, 1), w, color)
+        if self._bar_cache.get(bar_id) == key:
+            return
+        self._bar_cache[bar_id] = key
+        canvas.delete("all")
+        canvas.create_rectangle(0, 0, w, height, fill=BORDER, outline="")
+        fill_w = int(w * min(max(pct, 0), 100) / 100)
+        if fill_w > 0:
+            canvas.create_rectangle(0, 0, fill_w, height, fill=color, outline="")
+
     def _render(self, s) -> None:
-        # Quota bars
         u: UsageSnapshot | None = s.usage
+        rpt = s.report
+
+        # --- Quota rows ---
         for key, getters in (
-            ("5h", (lambda: u.five_hour_pct, lambda: u.five_hour_minutes_to_reset)),
-            ("7d", (lambda: u.seven_day_pct, lambda: u.seven_day_minutes_to_reset)),
+            ("5h", (lambda: u.five_hour_pct, lambda: u.five_hour_minutes_to_reset,
+                    lambda: u.five_hour_active, lambda: u.five_hour_reset)),
+            ("7d", (lambda: u.seven_day_pct, lambda: u.seven_day_minutes_to_reset,
+                    lambda: u.seven_day_active, lambda: u.seven_day_reset)),
         ):
-            pct_lbl, reset_lbl, bar_canvas = self.quota_widgets[key]
+            w = self.quota_widgets[key]
+            w["label"].config(text=t(w["label_key"]))  # i18n refresh
             if u is None:
-                pct_lbl.config(text="—", fg=FG_DIM)
-                reset_lbl.config(text=s.usage_error[:40] if s.usage_error else "loading…")
-                bar_canvas.delete("all")
+                w["pct"].config(text="—", fg=FG_DIM)
+                w["caption"].config(
+                    text=(s.usage_error[:60] if s.usage_error else t("loading")),
+                    fg=(DANGER if s.usage_error else FG_DIM))
+                self._draw_bar(key, w["bar"], 0, BORDER, 8)
                 continue
             pct = getters[0]()
             minutes = getters[1]()
+            active = getters[2]()
+            reset_iso = getters[3]()
             color = color_for_pct(pct)
-            pct_lbl.config(text=f"{pct:.0f}%", fg=color)
-            reset_lbl.config(text=f"resets {fmt_minutes(minutes)}")
-            bar_canvas.delete("all")
-            # NB: don't call update_idletasks here — that forces a synchronous
-            # redraw mid-tick and contributes to visible flicker. winfo_width()
-            # may be 1 on the very first tick before layout; the fallback covers it.
-            w = bar_canvas.winfo_width() or (WINDOW_W - 32)
-            # Background track
-            bar_canvas.create_rectangle(0, 0, w, 6, fill="#3a3c41", outline="")
-            # Fill
-            fill_w = int(w * min(pct, 100) / 100)
-            if fill_w > 0:
-                bar_canvas.create_rectangle(0, 0, fill_w, 6, fill=color, outline="")
+            w["pct"].config(text=f"{pct:.0f}%", fg=color)
+            if active:
+                clock = fmt_reset_clock(reset_iso)
+                if clock:
+                    cap = t("resets_at").format(time=clock, left=fmt_minutes(minutes))
+                else:
+                    # No parseable absolute time — fall back to relative only.
+                    cap = fmt_minutes(minutes)
+                w["caption"].config(text=cap, fg=FG_DIM)
+            else:
+                w["caption"].config(text=t("idle_full"), fg=FG_DIM)
+            self._draw_bar(key, w["bar"], pct, color, 8)
 
-        # Costs
-        rpt = s.report
+        # 7d Opus/Sonnet sub-rows — shown only when present.
+        sub_specs = (
+            ("opus", (u.seven_day_opus_pct if u else None)),
+            ("sonnet", (u.seven_day_sonnet_pct if u else None)),
+        )
+        for sub_key, sub_pct in sub_specs:
+            sr = self.subrows[sub_key]
+            sr["label"].config(text=t(sr["label_key"]))
+            if sub_pct is None:
+                if sr["frame"].winfo_ismapped():
+                    sr["frame"].pack_forget()
+                self._bar_cache.pop(f"{sub_key}_7d", None)
+                continue
+            if not sr["frame"].winfo_ismapped():
+                # Pack just before the bottom spacer so order stays stable.
+                sr["frame"].pack(fill="x", padx=10, pady=(0, 2))
+            color = color_for_pct(sub_pct)
+            sr["pct"].config(text=f"{sub_pct:.0f}%", fg=color)
+            self._draw_bar(f"{sub_key}_7d", sr["bar"], sub_pct, color, 4)
+
+        # --- Cost rows ---
+        # Refresh names for i18n.
+        for key in ("session", "today", "month"):
+            self.cost_labels[key + "_name"].config(
+                text=t(self.cost_labels[key + "_name_key"]))
+        self.cost_caption.config(text=t("cost_caption"))
         if rpt is None:
-            for v in self.cost_labels.values():
-                v.config(text="loading…")
+            for key in ("session", "today", "month"):
+                self.cost_labels[key].config(text=t("loading"))
         else:
             session_cost = rpt.by_session.get(rpt.last_session_id, Aggregate()).cost_usd
             self.cost_labels["session"].config(text=f"${session_cost:,.4f}")
             self.cost_labels["today"].config(text=f"${rpt.today.cost_usd:,.2f}")
             self.cost_labels["month"].config(text=f"${rpt.this_month.cost_usd:,.2f}")
 
-        # Projects: update existing rows in place; pack/forget to handle row-count changes.
+        # --- Projects (month-scoped) with proportional bars ---
+        self.proj_header_lbl.config(text=t("projects_header"))
         top: list[tuple[str, Aggregate]] = []
         if rpt is not None:
-            top = sorted(rpt.by_project.items(),
+            top = sorted(rpt.by_project_month.items(),
                          key=lambda kv: kv[1].cost_usd, reverse=True)[:self.PROJ_ROWS_MAX]
-        for i, (row, path_lbl, cost_lbl) in enumerate(self.proj_rows):
+        max_cost = top[0][1].cost_usd if top else 0.0
+        for i, pr in enumerate(self.proj_rows):
             if i < len(top):
                 cwd, agg = top[i]
-                short = cwd if len(cwd) <= 32 else "…" + cwd[-31:]
-                path_lbl.config(text=short)
-                cost_lbl.config(text=f"${agg.cost_usd:,.2f}")
-                if not row.winfo_ismapped():
-                    row.pack(fill="x", padx=10, pady=2)
-            elif row.winfo_ismapped():
-                row.pack_forget()
+                base, parent = _truncate_project(cwd)
+                pr["base"].config(text=base)
+                pr["parent"].config(text=parent)
+                pr["cost"].config(text=f"${agg.cost_usd:,.2f}")
+                # Bar width proportional to the top project's cost.
+                frac = (agg.cost_usd / max_cost * 100) if max_cost > 0 else 0
+                self._draw_bar(f"proj{i}", pr["bar"], frac, ACCENT, 2)
+                if not pr["container"].winfo_ismapped():
+                    pr["container"].pack(fill="x")
+            elif pr["container"].winfo_ismapped():
+                pr["container"].pack_forget()
+                self._bar_cache.pop(f"proj{i}", None)
 
-        # Footer
+        # --- Footer ---
         if s.usage_error:
-            self.footer.config(text=f"⚠ {s.usage_error[:50]}", fg=DANGER)
+            self.footer.config(text=s.usage_error[:60], fg=DANGER)
         else:
             import time as _t
             age = int(_t.time() - s.last_api_fetch) if s.last_api_fetch else -1
-            self.footer.config(text=f"updated {age}s ago" if age >= 0 else "", fg=FG_DIM)
+            self.footer.config(
+                text=(t("updated_ago").format(age=fmt_age(age)) if age >= 0 else ""),
+                fg=FG_DIM)
 
 
 class TaskbarStrip:
@@ -521,9 +979,10 @@ class TaskbarStrip:
     """
 
     def __init__(self, parent_root: tk.Tk, orch: Orchestrator,
-                 on_left_click: callable) -> None:
+                 on_left_click: callable, on_settings: callable | None = None) -> None:
         self.orch = orch
         self.on_left_click_cb = on_left_click
+        self.on_settings_cb = on_settings or (lambda: None)
         self.visible = True
         self.drag_mode = False
         self._drag_anchor: tuple[int, int, int, int] | None = None
@@ -547,6 +1006,10 @@ class TaskbarStrip:
         # Cap to the valid range so a hand-edited config can't put us in a weird state.
         raw_mode = cfg.get("display_mode", 1)
         self.display_mode = raw_mode if raw_mode in (1, 2, 3, 4) else 1
+        # Which screen edge the strip pins to when there's no saved drag position.
+        # Configurable via Settings → Strip; defaults to the module-level STRIP_SIDE.
+        raw_side = cfg.get("side", STRIP_SIDE)
+        self.side = raw_side if raw_side in ("left", "right") else STRIP_SIDE
 
         self.win = tk.Toplevel(parent_root)
         self.win.overrideredirect(True)         # no title bar / borders
@@ -560,6 +1023,16 @@ class TaskbarStrip:
 
         # Strip width is dynamic — grown/shrunk to fit the rendered text each tick.
         self.strip_w = STRIP_W
+
+        # Last rendered content signature for the anti-flicker short-circuit in
+        # _render. None forces the next render. Setters that change appearance in
+        # ways the signature might not capture reset this to None for safety.
+        self._render_sig: tuple | None = None
+        # Last geometry actually applied by _reposition — lets us skip redundant
+        # geometry() calls (each one can momentarily disturb the strip).
+        self._applied_geom: tuple[int, int, int] | None = None
+        # Tick counter for the periodic non-disruptive topmost reassert (A3).
+        self._tick_count = 0
 
         # Font instances (not just tuples) so we can call .measure() during layout.
         self.font_main = tkfont.Font(family="Segoe UI Semibold", size=9)
@@ -584,14 +1057,12 @@ class TaskbarStrip:
             widget.bind("<ButtonRelease-1>", self._on_btn1_release)
             widget.bind("<Button-3>", self._on_right_click)
 
-        # Right-click context menu
+        # Right-click context menu. Entries are (re)populated on each popup via
+        # _rebuild_menu so labels follow the current UI language (tk.Menu labels
+        # are static once added, unlike pystray's callable text).
         self._menu = tk.Menu(self.win, tearoff=0, bg=PANEL, fg=FG,
                              activebackground=ACCENT, activeforeground="white",
                              borderwidth=0)
-        self._menu.add_command(label="Show window", command=self._on_show_window)
-        self._menu.add_command(label="Refresh now", command=self.orch.refresh_now)
-        self._menu.add_separator()
-        self._menu.add_command(label="Hide strip", command=self.hide)
 
         # Validate saved drag position before first paint: only catches
         # *truly off-screen* positions (previous run was on a now-disconnected
@@ -644,25 +1115,33 @@ class TaskbarStrip:
         save_config(cfg)
 
     def _reposition(self) -> None:
-        # Skip geometry update during a drag (mouse drives it); always still
-        # call the topmost bump below so dragging doesn't lose z-order.
+        # Skip geometry update during a drag (mouse drives it). Topmost handling
+        # is NOT done here anymore — _tick owns the topmost policy (A3), and
+        # show() reasserts explicitly. Calling _force_topmost() every tick from
+        # here was the source of the occasional blink: its off→on toggle could
+        # momentarily drop the strip behind the taskbar.
         drag_active = self.drag_mode and self._drag_anchor is not None
-        if not drag_active:
-            if self._custom_pos is not None:
-                x, y = self._custom_pos
+        if drag_active:
+            return
+        if self._custom_pos is not None:
+            x, y = self._custom_pos
+        else:
+            sw = self.win.winfo_screenwidth()
+            sh = self.win.winfo_screenheight()
+            if self.side == "left":
+                x = STRIP_SIDE_MARGIN
             else:
-                sw = self.win.winfo_screenwidth()
-                sh = self.win.winfo_screenheight()
-                if STRIP_SIDE == "left":
-                    x = STRIP_SIDE_MARGIN
-                else:
-                    x = sw - self.strip_w - STRIP_SIDE_MARGIN
-                # Default sits ON the taskbar (centered in its band), NOT just
-                # above it — see get_strip_default_y for why that's the only
-                # placement maximized windows can't cover.
-                y = get_strip_default_y(sh)
+                x = sw - self.strip_w - STRIP_SIDE_MARGIN
+            # Default sits ON the taskbar (centered in its band), NOT just
+            # above it — see get_strip_default_y for why that's the only
+            # placement maximized windows can't cover.
+            y = get_strip_default_y(sh)
+        # Only touch geometry when it actually changed — a no-op geometry() call
+        # each tick is wasteful and can disturb the window.
+        geom = (self.strip_w, x, y)
+        if geom != self._applied_geom:
+            self._applied_geom = geom
             self.win.geometry(f"{self.strip_w}x{STRIP_H}+{x}+{y}")
-        self._force_topmost()
 
     def _force_topmost(self) -> None:
         """The standard tkinter-on-Windows 'bump trick': toggle -topmost off
@@ -758,9 +1237,12 @@ class TaskbarStrip:
 
     def show(self) -> None:
         self.visible = True
+        # Force geometry to be re-applied after a hide/show cycle.
+        self._applied_geom = None
         self._reposition()
         self.win.deiconify()
-        self.win.attributes("-topmost", True)   # re-assert in case Windows demoted it
+        # _reposition() no longer bumps topmost (A3) — do it explicitly here.
+        self._force_topmost()
 
     def hide(self) -> None:
         self.visible = False
@@ -769,6 +1251,15 @@ class TaskbarStrip:
     def _on_show_window(self) -> None:
         """Menu command — always opens the main window regardless of drag mode."""
         self.on_left_click_cb()
+
+    def _rebuild_menu(self) -> None:
+        """Repopulate the right-click menu with current-language labels."""
+        self._menu.delete(0, "end")
+        self._menu.add_command(label=t("show_window"), command=self._on_show_window)
+        self._menu.add_command(label=t("refresh_now"), command=self.orch.refresh_now)
+        self._menu.add_command(label=t("settings"), command=self.on_settings_cb)
+        self._menu.add_separator()
+        self._menu.add_command(label=t("hide_strip"), command=self.hide)
 
     def _on_btn1_press(self, event) -> None:
         if self.drag_mode:
@@ -821,19 +1312,38 @@ class TaskbarStrip:
             pass
         # Force a redraw so the outline rectangle (or its removal) shows up
         # immediately rather than waiting for the next tick.
+        self._render_sig = None
         try:
             self._render(self.orch.snapshot())
         except Exception:
             logging.getLogger(__name__).exception("strip redraw on drag toggle failed")
 
     def reset_position(self) -> None:
-        """Clear the saved custom position and snap back to STRIP_SIDE defaults."""
+        """Clear the saved custom position and snap back to side defaults."""
         self._custom_pos = None
         cfg = load_config()
         if "strip" in cfg:
             cfg["strip"].pop("x", None)
             cfg["strip"].pop("y", None)
         save_config(cfg)
+        self._reposition()
+
+    def set_side(self, side: str) -> None:
+        """Switch the default screen edge (left/right) and persist. Clears any
+        saved drag position so the new side takes effect immediately (a saved
+        x/y would otherwise override side placement)."""
+        if side not in ("left", "right"):
+            return
+        self.side = side
+        self._custom_pos = None
+        cfg = load_config()
+        cfg.setdefault("strip", {})
+        cfg["strip"]["side"] = side
+        cfg["strip"].pop("x", None)
+        cfg["strip"].pop("y", None)
+        save_config(cfg)
+        # Force geometry recompute on the new side.
+        self._applied_geom = None
         self._reposition()
 
     def set_show_background(self, enabled: bool) -> None:
@@ -843,6 +1353,7 @@ class TaskbarStrip:
         cfg.setdefault("strip", {})
         cfg["strip"]["show_background"] = enabled
         save_config(cfg)
+        self._render_sig = None
         try:
             self._render(self.orch.snapshot())
         except Exception:
@@ -857,12 +1368,14 @@ class TaskbarStrip:
         cfg.setdefault("strip", {})
         cfg["strip"]["display_mode"] = mode
         save_config(cfg)
+        self._render_sig = None
         try:
             self._render(self.orch.snapshot())
         except Exception:
             logging.getLogger(__name__).exception("strip redraw on mode change failed")
 
     def _on_right_click(self, event) -> None:
+        self._rebuild_menu()
         try:
             self._menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -874,16 +1387,18 @@ class TaskbarStrip:
         except Exception:
             logging.getLogger(__name__).exception("strip render failed")
         if self.visible:
+            self._tick_count += 1
             self._reposition()
-            # _reposition() already bumps once per tick. If we detect we're
-            # actively covered right now (post-Settings flyout, post-Quick-
-            # Settings, post-autostart shell init), escalate with both the
-            # tkinter trick AND the direct SetWindowPos backup. This is the
-            # piece that keeps the strip visible when pinned over the
-            # taskbar — without it, we'd be stuck behind the taskbar
-            # whenever Windows re-asserted its z-order.
+            # Topmost policy (A3): only do the disruptive off→on toggle when we
+            # actually detect we're covered (post-Settings/Quick-Settings flyout,
+            # post-autostart shell init). When we're already on top, a periodic
+            # non-disruptive reassert via SetWindowPos(HWND_TOPMOST) — no toggle —
+            # is enough to defend z-order without ever risking the blink the
+            # toggle could cause.
             if self._is_covered():
                 self._force_topmost()
+                self._force_topmost_winapi()
+            elif self._tick_count % 20 == 0:
                 self._force_topmost_winapi()
         self.win.after(1000, self._tick)
 
@@ -904,16 +1419,21 @@ class TaskbarStrip:
         return font.measure(text)
 
     def _append_quota_parts(self, parts: list, label_key: str, quota_pct: float,
-                            mins_remaining: int, total_window_min: int) -> None:
+                            mins_remaining: int, total_window_min: int,
+                            active: bool = True) -> None:
         """Append the (text, color, font) pieces for one quota's display in the
         currently selected display_mode. Caller is responsible for any leading
         separator. Pieces are appended in reading order (caller packs left-to-right
         OR right-to-left based on STRIP_SIDE).
+
+        When `active` is False (no live window — the endpoint reports 0% with no
+        resets_at), render just the quota% regardless of display_mode and skip
+        the time suffix entirely: "(0m)" / "/0%" / "/100%" would all be lies.
         """
         parts.append((t(label_key) + " ", FG_DIM, self.font_dim))
         quota_color = color_for_pct(quota_pct)
-        if self.display_mode == 1:
-            # Mode 1: just the quota%
+        if not active or self.display_mode == 1:
+            # Inactive (or compact mode 1): just the quota%
             parts.append((f"{quota_pct:.0f}%", quota_color, self.font_main))
         elif self.display_mode == 2:
             # Mode 2: quota% (time remaining)
@@ -951,10 +1471,12 @@ class TaskbarStrip:
         parts: list[tuple[str, str, tkfont.Font]] = []
         if u is not None:
             self._append_quota_parts(parts, "5h", u.five_hour_pct,
-                                     u.five_hour_minutes_to_reset, TOTAL_5H_MIN)
+                                     u.five_hour_minutes_to_reset, TOTAL_5H_MIN,
+                                     active=u.five_hour_active)
             parts.append(("   ·   ", FG_DIM, self.font_dim))
             self._append_quota_parts(parts, "7d", u.seven_day_pct,
-                                     u.seven_day_minutes_to_reset, TOTAL_7D_MIN)
+                                     u.seven_day_minutes_to_reset, TOTAL_7D_MIN,
+                                     active=u.seven_day_active)
         if rpt is not None:
             if u is not None:
                 parts.append(("   ·   ", FG_DIM, self.font_dim))
@@ -962,6 +1484,21 @@ class TaskbarStrip:
             parts.append((f"${rpt.today.cost_usd:,.2f}", FG, self.font_main))
         if not parts:
             return  # nothing to draw yet (initial state before first data lands)
+
+        # Anti-flicker: skip the whole redraw when nothing visible changed. The
+        # signature captures every input to the canvas drawing — the text/color/
+        # font of each piece plus the two boolean visual modes. _tick runs this
+        # every 1s; without the short-circuit we'd clear and repaint identical
+        # pixels each time, which is both wasteful and a visible flicker source.
+        # Setters that must force a redraw reset self._render_sig to None.
+        sig = (
+            tuple((text, color, str(font)) for text, color, font in parts),
+            self.drag_mode,
+            self.show_background,
+        )
+        if sig == self._render_sig:
+            return
+        self._render_sig = sig
 
         # Clear previous frame and re-draw from scratch.
         self.canvas.delete("all")
@@ -999,6 +1536,350 @@ class TaskbarStrip:
                 self._reposition()
 
 
+# Example strings shown under each display-mode radio in Settings → Strip, so
+# the user can preview what each mode looks like before picking it.
+_MODE_EXAMPLES = {
+    1: "5h 44%",
+    2: "5h 44% (2h 13m)",
+    3: "5h 44%/56%",
+    4: "5h 44%/44%",
+}
+
+
+class SettingsWindow:
+    """A single real settings window (Toplevel) replacing the deep tray submenus.
+
+    Singleton: open_settings() lifts/focuses an existing instance instead of
+    making a second one. Constructed/opened ONLY on the tk main thread.
+    Three tabs (General / Strip / About) driven by a custom segmented tab bar
+    (flat tk.Buttons) — NOT ttk.Notebook, whose native tabs ignore the dark theme.
+    """
+
+    _instance: "SettingsWindow | None" = None
+
+    @classmethod
+    def open(cls, root: tk.Tk, orch: Orchestrator, strip,
+             on_lang_change: callable) -> "SettingsWindow":
+        """Open the settings window, or lift the existing one to the front."""
+        inst = cls._instance
+        if inst is not None and inst._alive():
+            inst.win.deiconify()
+            inst.win.lift()
+            inst.win.focus_force()
+            return inst
+        inst = cls(root, orch, strip, on_lang_change)
+        cls._instance = inst
+        return inst
+
+    def __init__(self, root: tk.Tk, orch: Orchestrator, strip,
+                 on_lang_change: callable) -> None:
+        self.root = root
+        self.orch = orch
+        self.strip = strip
+        self.on_lang_change = on_lang_change
+        self.active_tab = "general"
+
+        self.win = tk.Toplevel(root)
+        # Build withdrawn, then deiconify after layout to avoid a placement flash.
+        self.win.withdraw()
+        self.win.title(t("settings_title"))
+        self.win.configure(bg=BG)
+        self.win.geometry("430x470")
+        self.win.minsize(430, 470)
+        self.win.resizable(False, False)
+        self.win.transient(root)            # tied to the main window, NOT topmost
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+
+        # Tk variables backing the live controls. Recreated each rebuild so a
+        # language switch (which rebuilds) starts from current persisted state.
+        self.tab_buttons: dict[str, tk.Button] = {}
+        self.tab_underlines: dict[str, tk.Frame] = {}
+        self.content_frames: dict[str, tk.Frame] = {}
+
+        self._build_shell()
+        self.rebuild()
+        self.show_tab(self.active_tab)
+
+        self.win.update_idletasks()
+        self.win.deiconify()
+        self.win.lift()
+        self.win.focus_force()
+
+    # ---- lifecycle ----
+
+    def _alive(self) -> bool:
+        try:
+            return bool(self.win.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def close(self) -> None:
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+        if SettingsWindow._instance is self:
+            SettingsWindow._instance = None
+
+    # ---- shell (tab bar + content host) — built once ----
+
+    def _build_shell(self) -> None:
+        bar = tk.Frame(self.win, bg=BG)
+        bar.pack(fill="x", side="top")
+        for key in ("general", "strip", "about"):
+            col = tk.Frame(bar, bg=BG)
+            col.pack(side="left", fill="x", expand=True)
+            btn = tk.Button(
+                col, text="", bg=BG, fg=FG_DIM, bd=0,
+                font=("Segoe UI Semibold", 10), cursor="hand2",
+                activebackground=PANEL, activeforeground=FG,
+                command=lambda k=key: self.show_tab(k),
+            )
+            btn.pack(fill="x", ipady=8)
+            underline = tk.Frame(col, bg=BG, height=2)
+            underline.pack(fill="x")
+            self.tab_buttons[key] = btn
+            self.tab_underlines[key] = underline
+        # Thin separator under the tab bar.
+        tk.Frame(self.win, bg=BORDER, height=1).pack(fill="x")
+
+        # Content host — the three tab frames are packed/forgotten inside it.
+        self.host = tk.Frame(self.win, bg=BG)
+        self.host.pack(fill="both", expand=True)
+
+    # ---- content (rebuilt on language change) ----
+
+    def rebuild(self) -> None:
+        """(Re)build all tab content in place. Called on construction and after a
+        language switch so every label reflects the current language immediately."""
+        # Tab bar labels.
+        for key, label_key in (("general", "tab_general"),
+                               ("strip", "tab_strip"),
+                               ("about", "tab_about")):
+            self.tab_buttons[key].config(text=t(label_key))
+        self.win.title(t("settings_title"))
+
+        # Drop old content frames.
+        for fr in self.content_frames.values():
+            fr.destroy()
+        self.content_frames.clear()
+
+        self.content_frames["general"] = self._build_general()
+        self.content_frames["strip"] = self._build_strip_tab()
+        self.content_frames["about"] = self._build_about()
+        # Re-apply the active tab so the rebuilt frame is shown + tab styled.
+        self.show_tab(self.active_tab)
+
+    def show_tab(self, key: str) -> None:
+        self.active_tab = key
+        for k, fr in self.content_frames.items():
+            if k == key:
+                fr.pack(fill="both", expand=True)
+            elif fr.winfo_ismapped():
+                fr.pack_forget()
+        # Tab styling: active = ACCENT fg + PANEL bg + ACCENT underline.
+        for k, btn in self.tab_buttons.items():
+            if k == key:
+                btn.config(fg=ACCENT, bg=PANEL, activebackground=PANEL)
+                self.tab_underlines[k].config(bg=ACCENT)
+            else:
+                btn.config(fg=FG_DIM, bg=BG, activebackground=PANEL)
+                self.tab_underlines[k].config(bg=BG)
+
+    # ---- small styled-control helpers ----
+
+    def _section(self, parent: tk.Frame, text: str) -> None:
+        tk.Label(parent, text=text, bg=BG, fg=FG_DIM,
+                 font=("Segoe UI Semibold", 9)).pack(anchor="w", pady=(12, 4))
+
+    def _checkbox(self, parent: tk.Frame, text: str, var: tk.BooleanVar,
+                  cmd: callable) -> tk.Checkbutton:
+        cb = tk.Checkbutton(
+            parent, text=text, variable=var, command=cmd,
+            bg=BG, fg=FG, selectcolor=PANEL, activebackground=BG,
+            activeforeground=FG, font=("Segoe UI", 10), anchor="w",
+            highlightthickness=0, bd=0, cursor="hand2",
+        )
+        cb.pack(anchor="w", pady=2)
+        return cb
+
+    def _radio(self, parent: tk.Frame, text: str, var: tk.Variable, value,
+               cmd: callable) -> tk.Radiobutton:
+        rb = tk.Radiobutton(
+            parent, text=text, variable=var, value=value, command=cmd,
+            bg=BG, fg=FG, selectcolor=PANEL, activebackground=BG,
+            activeforeground=FG, font=("Segoe UI", 10), anchor="w",
+            highlightthickness=0, bd=0, cursor="hand2",
+        )
+        rb.pack(anchor="w", pady=1)
+        return rb
+
+    def _flat_button(self, parent: tk.Frame, text: str, cmd: callable) -> tk.Button:
+        btn = tk.Button(
+            parent, text=text, command=cmd, bg=PANEL, fg=FG, bd=0,
+            font=("Segoe UI", 9), activebackground=BORDER, activeforeground=FG,
+            cursor="hand2", padx=12, pady=5,
+        )
+        btn.pack(anchor="w", pady=4)
+        return btn
+
+    # ---- Tab 1: General ----
+
+    def _build_general(self) -> tk.Frame:
+        fr = tk.Frame(self.host, bg=BG)
+        pad = 16
+
+        inner = tk.Frame(fr, bg=BG)
+        inner.pack(fill="both", expand=True, padx=pad, pady=4)
+
+        # Language
+        self._section(inner, t("language"))
+        self.lang_var = tk.StringVar(value=get_app_language())
+        self._radio(inner, t("lang_en"), self.lang_var, "en", self._on_lang)
+        self._radio(inner, t("lang_zh"), self.lang_var, "zh", self._on_lang)
+
+        # Run at startup
+        self._section(inner, t("run_at_startup"))
+        self.startup_var = tk.BooleanVar(value=is_autostart_enabled())
+        self._checkbox(inner, t("run_at_startup"), self.startup_var,
+                       self._on_startup_toggle)
+
+        # Version + project page
+        self._section(inner, t("version_label"))
+        tk.Label(inner, text=f"v{__version__}", bg=BG, fg=FG,
+                 font=("Segoe UI", 10)).pack(anchor="w")
+        self._flat_button(inner, t("project_page"), self._on_project_page)
+        return fr
+
+    def _on_lang(self) -> None:
+        set_app_language(self.lang_var.get())
+        # Rebuild our own content so labels update immediately, then notify the
+        # rest of the app (strip relabel, etc).
+        self.rebuild()
+        try:
+            self.on_lang_change()
+        except Exception:
+            logging.getLogger(__name__).exception("on_lang_change failed")
+
+    def _on_startup_toggle(self) -> None:
+        want = bool(self.startup_var.get())
+        ok = create_autostart_entry() is not None if want else remove_autostart_entry()
+        if not ok:
+            # Revert the checkbox to reflect reality; never crash.
+            self.startup_var.set(not want)
+
+    def _on_project_page(self) -> None:
+        try:
+            webbrowser.open(PROJECT_URL)
+        except Exception:
+            logging.getLogger(__name__).exception("failed to open project page")
+
+    # ---- Tab 2: Strip ----
+
+    def _build_strip_tab(self) -> tk.Frame:
+        fr = tk.Frame(self.host, bg=BG)
+        pad = 16
+        inner = tk.Frame(fr, bg=BG)
+        inner.pack(fill="both", expand=True, padx=pad, pady=4)
+
+        strip = self.strip
+
+        # Visibility + background
+        self.strip_show_var = tk.BooleanVar(value=bool(strip and strip.visible))
+        self._checkbox(inner, t("strip_show"), self.strip_show_var,
+                       self._on_strip_show)
+        self.strip_bg_var = tk.BooleanVar(value=bool(strip and strip.show_background))
+        self._checkbox(inner, t("strip_opaque_bg"), self.strip_bg_var,
+                       self._on_strip_bg)
+
+        # Screen position
+        self._section(inner, t("strip_screen_pos"))
+        cur_side = strip.side if strip else load_config().get("strip", {}).get("side", "left")
+        self.strip_side_var = tk.StringVar(value=cur_side)
+        self._radio(inner, t("pos_left"), self.strip_side_var, "left", self._on_strip_side)
+        self._radio(inner, t("pos_right"), self.strip_side_var, "right", self._on_strip_side)
+
+        # Display mode (radios with example strings)
+        self._section(inner, t("strip_display_mode"))
+        self.strip_mode_var = tk.IntVar(value=(strip.display_mode if strip else 1))
+        for mode in (1, 2, 3, 4):
+            self._radio(inner, t(f"mode_{mode}"), self.strip_mode_var, mode,
+                        self._on_strip_mode)
+            tk.Label(inner, text=_MODE_EXAMPLES[mode], bg=BG, fg=FG_DIM,
+                     font=("Segoe UI", 8)).pack(anchor="w", padx=(24, 0))
+
+        # Action buttons (drag toggle + reset)
+        row = tk.Frame(inner, bg=BG)
+        row.pack(fill="x", pady=(12, 0))
+        self.drag_btn = tk.Button(
+            row, text=self._drag_label(), command=self._on_strip_drag,
+            bg=PANEL, fg=FG, bd=0, font=("Segoe UI", 9),
+            activebackground=BORDER, activeforeground=FG, cursor="hand2",
+            padx=12, pady=5,
+        )
+        self.drag_btn.pack(side="left", padx=(0, 8))
+        tk.Button(
+            row, text=t("strip_reset_pos"), command=self._on_strip_reset,
+            bg=PANEL, fg=FG, bd=0, font=("Segoe UI", 9),
+            activebackground=BORDER, activeforeground=FG, cursor="hand2",
+            padx=12, pady=5,
+        ).pack(side="left")
+        return fr
+
+    def _drag_label(self) -> str:
+        on = bool(self.strip and self.strip.drag_mode)
+        return t("strip_drag_on") if on else t("strip_drag_off")
+
+    def _marshal(self, fn) -> None:
+        """Strip mutations must run on the tk main thread; we're already on it
+        here (Settings opens on main thread), but route through after(0,...) to
+        match the established pattern and stay safe if called otherwise."""
+        self.root.after(0, fn)
+
+    def _on_strip_show(self) -> None:
+        if not self.strip:
+            return
+        self._marshal(self.strip.show if self.strip_show_var.get() else self.strip.hide)
+
+    def _on_strip_bg(self) -> None:
+        if self.strip:
+            self._marshal(lambda: self.strip.set_show_background(bool(self.strip_bg_var.get())))
+
+    def _on_strip_side(self) -> None:
+        if self.strip:
+            self._marshal(lambda: self.strip.set_side(self.strip_side_var.get()))
+
+    def _on_strip_mode(self) -> None:
+        if self.strip:
+            self._marshal(lambda: self.strip.set_display_mode(int(self.strip_mode_var.get())))
+
+    def _on_strip_drag(self) -> None:
+        if not self.strip:
+            return
+        new_val = not self.strip.drag_mode
+        self._marshal(lambda: self.strip.set_drag_mode(new_val))
+        # Relabel after the toggle is applied.
+        self.root.after(0, lambda: self.drag_btn.config(text=self._drag_label()))
+
+    def _on_strip_reset(self) -> None:
+        if self.strip:
+            self._marshal(self.strip.reset_position)
+
+    # ---- Tab 3: About ----
+
+    def _build_about(self) -> tk.Frame:
+        fr = tk.Frame(self.host, bg=BG)
+        pad = 16
+        inner = tk.Frame(fr, bg=BG)
+        inner.pack(fill="both", expand=True, padx=pad, pady=8)
+        tk.Label(inner, text=f"{t('win_title')}  v{__version__}", bg=BG, fg=FG,
+                 font=("Segoe UI Semibold", 12)).pack(anchor="w", pady=(0, 8))
+        tk.Label(inner, text=t("about_blurb"), bg=BG, fg=FG_DIM,
+                 font=("Segoe UI", 9), justify="left", anchor="w",
+                 wraplength=390).pack(anchor="w", fill="x")
+        return fr
+
+
 class TrayApp:
     """pystray wrapper. Tray icon shows 5h %, menu toggles window."""
 
@@ -1010,62 +1891,33 @@ class TrayApp:
         self._stop_callback: callable = lambda: None
         self.icon = pystray.Icon(
             "claude-usage",
-            render_tray_icon(0),
-            "Claude Usage",
+            render_tray_icon(None),
+            f"Claude Usage v{__version__}",
             menu=self._build_menu(),
         )
 
     def _build_menu(self) -> pystray.Menu:
-        # Top level kept to 4 items. Everything configurable lives under
-        # Settings → ... — nested submenus keep the right-click menu short and
-        # the daily-driver actions (Show / Refresh / Quit) immediately visible.
+        # Slim top-level menu. Most configuration moved into the real Settings
+        # window (opened by the Settings… item); only the daily-driver actions
+        # and a quick strip toggle + display-mode picker stay in the tray.
         return pystray.Menu(
             pystray.MenuItem(lambda _i: t("show_window"), self._on_show, default=True),
             pystray.MenuItem(lambda _i: t("refresh_now"),
                              lambda _i: self.orch.refresh_now()),
-            pystray.MenuItem(lambda _i: t("settings"), self._build_settings_menu()),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem(lambda _i: t("quit"), self._on_quit),
-        )
-
-    def _build_settings_menu(self) -> pystray.Menu:
-        """Settings submenu — visibility/appearance/behavior, plus nested
-        display-mode and language pickers."""
-        return pystray.Menu(
-            # Strip-related toggles
+            pystray.MenuItem(lambda _i: t("settings"),
+                             lambda _i, _it: self._open_settings()),
             pystray.MenuItem(
                 lambda _i: t("show_strip"),
                 lambda _i, _it: self._on_strip_toggle(),
                 checked=lambda _it: bool(self.strip and self.strip.visible),
             ),
-            pystray.MenuItem(
-                lambda _i: t("opaque_bg"),
-                lambda _i, _it: self._on_strip_bg_toggle(),
-                checked=lambda _it: bool(self.strip and self.strip.show_background),
-            ),
-            pystray.MenuItem(
-                lambda _i: t("move_strip"),
-                lambda _i, _it: self._on_strip_drag_toggle(),
-                checked=lambda _it: bool(self.strip and self.strip.drag_mode),
-            ),
-            pystray.MenuItem(
-                lambda _i: t("reset_strip_position"),
-                lambda _i, _it: self._on_strip_reset(),
-            ),
-            # Sub-sub-menus
             pystray.MenuItem(lambda _i: t("display_mode"), self._build_display_mode_menu()),
-            pystray.MenuItem(lambda _i: t("language"), self._build_language_menu()),
             pystray.Menu.SEPARATOR,
-            # Window-related
-            pystray.MenuItem(
-                lambda _i: t("always_on_top"),
-                lambda _i, _it: self._on_topmost_toggle(_it),
-                checked=lambda _it: bool(self.window.topmost_var.get()),
-            ),
+            pystray.MenuItem(lambda _i: t("quit"), self._on_quit),
         )
 
     def _build_display_mode_menu(self) -> pystray.Menu:
-        """Radio-style picker for the three strip layouts."""
+        """Radio-style picker for the four strip layouts (kept for quick access)."""
         def make(mode: int, label_key: str) -> pystray.MenuItem:
             return pystray.MenuItem(
                 lambda _i: t(label_key),
@@ -1078,16 +1930,21 @@ class TrayApp:
             make(3, "mode_3"), make(4, "mode_4"),
         )
 
-    def _build_language_menu(self) -> pystray.Menu:
-        """Radio-style picker for UI language. Currently English + 中文."""
-        def make(code: str, label: str) -> pystray.MenuItem:
-            return pystray.MenuItem(
-                label,  # static — language names are conventionally untranslated
-                lambda _i, _it: self._on_set_language(code),
-                checked=lambda _it: get_app_language() == code,
-                radio=True,
-            )
-        return pystray.Menu(make("en", "English"), make("zh", "中文"))
+    def _open_settings(self) -> None:
+        """Open (or focus) the Settings window. Must run on the tk main thread."""
+        self.window.root.after(0, lambda: SettingsWindow.open(
+            self.window.root, self.orch, self.strip,
+            on_lang_change=self._relabel_strip))
+
+    def _relabel_strip(self) -> None:
+        """Force an immediate strip redraw so its labels reflect a just-changed
+        language without waiting for the next natural tick."""
+        if self.strip is not None:
+            self.strip._render_sig = None
+            try:
+                self.strip._render(self.orch.snapshot())
+            except Exception:
+                logging.getLogger(__name__).exception("strip relabel failed")
 
     def _on_strip_toggle(self) -> None:
         if self.strip is None:
@@ -1097,46 +1954,14 @@ class TrayApp:
         else:
             self.window.root.after(0, self.strip.show)
 
-    def _on_strip_drag_toggle(self) -> None:
-        if self.strip is None:
-            return
-        new_val = not self.strip.drag_mode
-        self.window.root.after(0, lambda: self.strip.set_drag_mode(new_val))
-
-    def _on_strip_bg_toggle(self) -> None:
-        if self.strip is None:
-            return
-        new_val = not self.strip.show_background
-        self.window.root.after(0, lambda: self.strip.set_show_background(new_val))
-
-    def _on_strip_reset(self) -> None:
-        if self.strip is None:
-            return
-        self.window.root.after(0, self.strip.reset_position)
-
     def _on_set_display_mode(self, mode: int) -> None:
         if self.strip is None:
             return
         self.window.root.after(0, lambda: self.strip.set_display_mode(mode))
 
-    def _on_set_language(self, lang: str) -> None:
-        # Language is global; menu text is callable so it'll re-evaluate on
-        # next menu open. The strip picks up the new language on its next
-        # render tick automatically.
-        set_app_language(lang)
-        # Force an immediate strip redraw so labels update before the next
-        # natural tick — feels more responsive than waiting 1s.
-        if self.strip is not None:
-            self.window.root.after(0, lambda: self.strip._render(self.orch.snapshot()))
-
     def _on_show(self, _icon=None, _item=None) -> None:
         # tkinter calls must happen on the main thread.
         self.window.root.after(0, self.window.show)
-
-    def _on_topmost_toggle(self, _item) -> None:
-        new_val = not self.window.topmost_var.get()
-        self.window.topmost_var.set(new_val)
-        self.window.root.after(0, self.window._toggle_topmost)
 
     def _on_quit(self, _icon=None, _item=None) -> None:
         self.icon.stop()
@@ -1156,13 +1981,13 @@ class TrayApp:
 
 def notify(kind: str, pct: float) -> None:
     """Pop a Windows toast notification for a threshold crossing."""
-    window_label = "5-hour window" if kind.startswith("5h") else "Weekly quota"
-    title = f"Claude {window_label} at {pct:.0f}%"
-    body = "Heads up — you may want to slow down or switch projects."
+    window_label = t("toast_5h_window") if kind.startswith("5h") else t("toast_weekly")
+    title = t("toast_title").format(window=window_label, pct=f"{pct:.0f}")
+    body = t("toast_body_default")
     if pct >= 95:
-        body = "Very close to the limit. Stop or you'll get rate-limited."
+        body = t("toast_body_95")
     elif pct >= 90:
-        body = "Approaching the limit. Plan accordingly."
+        body = t("toast_body_90")
     toast = Notification(
         app_id="Claude Usage",
         title=title,
@@ -1182,6 +2007,19 @@ def main() -> int:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
 
+    # Single-instance guard. A named mutex in the Local namespace is per-session;
+    # if it already exists another copy of us is running (common when autostart
+    # and a manual launch race, or the user clicks the shortcut twice). Bail
+    # quietly — no toast, because winotify spawns powershell and we want this
+    # early exit to stay dependency-free and instant. The handle intentionally
+    # leaks: the OS frees it on process exit, which is exactly when we want the
+    # mutex released.
+    _kernel32.CreateMutexW(None, False, "Local\\cc-usage-tray-singleton")
+    if _kernel32.GetLastError() == _ERROR_ALREADY_EXISTS:
+        logging.getLogger(__name__).info(
+            "another instance is already running; exiting")
+        return 0
+
     # Restore the saved language before any UI is built — menu and strip both
     # read it at render time, so setting it here makes the first frame correct.
     global _current_lang
@@ -1192,8 +2030,26 @@ def main() -> int:
     orch = Orchestrator()
     # Wire callbacks AFTER constructing window+tray so we can reference them.
     window = FloatingWindow(orch, on_close=lambda: None)
+
+    # Strip's right-click "Settings…" opens the same singleton SettingsWindow as
+    # the tray; relabel the strip on a language change made from there.
+    def open_settings() -> None:
+        def _o() -> None:
+            sw = SettingsWindow.open(window.root, orch, strip,
+                                     on_lang_change=relabel_strip)
+            return sw
+        window.root.after(0, _o)
+
+    def relabel_strip() -> None:
+        strip._render_sig = None
+        try:
+            strip._render(orch.snapshot())
+        except Exception:
+            logging.getLogger(__name__).exception("strip relabel failed")
+
     # Strip is a Toplevel parented to window.root — shares the tk main loop.
-    strip = TaskbarStrip(window.root, orch, on_left_click=window.show)
+    strip = TaskbarStrip(window.root, orch, on_left_click=window.show,
+                         on_settings=open_settings)
     tray = TrayApp(orch, window, strip=strip)
 
     # When state changes, update tray badge with current 5h%.
@@ -1202,7 +2058,7 @@ def main() -> int:
         if s.usage is not None:
             pct = s.usage.five_hour_pct
             tooltip = (
-                f"Claude Usage\n"
+                f"{t('win_title')} v{__version__}\n"
                 f"5h: {pct:.0f}%  resets {fmt_minutes(s.usage.five_hour_minutes_to_reset)}\n"
                 f"7d: {s.usage.seven_day_pct:.0f}%  resets {fmt_minutes(s.usage.seven_day_minutes_to_reset)}"
             )
@@ -1213,6 +2069,11 @@ def main() -> int:
     orch.start()
     tray._stop_callback = window.root.quit
     tray.run_detached()
+
+    # Debug/verification aid: --show-window pops the floating window shortly after
+    # startup so a launched instance is immediately visible.
+    if "--show-window" in sys.argv:
+        window.root.after(400, window.show)
 
     # Run tkinter main loop on main thread. Window is initially hidden;
     # user clicks tray → "Show window" to make it visible.

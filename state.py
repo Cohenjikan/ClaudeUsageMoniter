@@ -8,19 +8,36 @@ Threading model:
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 import urllib.error
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 from jsonl_costs import UsageReport, build_report
 from usage_api import (
     OAuthCreds, UsageSnapshot, fetch_usage, load_oauth_creds, refresh_and_save,
+    snapshot_from_body,
 )
 
 log = logging.getLogger(__name__)
+
+# Last-good usage snapshot persisted next to the scripts. Lets the UI show the
+# most recent known quota (with an honest age) immediately on launch, instead of
+# blanking until the first network fetch succeeds — which after an overnight boot
+# always needs a token refresh first and can be delayed by a boot-time network
+# race or a refresh cooldown.
+USAGE_CACHE_PATH = Path(__file__).parent / "usage_cache.json"
+
+# Fast-retry ladder (seconds) used when the first fetch hasn't succeeded yet or a
+# network-class error occurs, so quota appears promptly once connectivity / the
+# refresh cooldown clears. Indexed by consecutive-failure count; past the end we
+# fall back to the normal API_INTERVAL_SEC cadence. HTTP 429 and invalid_grant
+# are NOT laddered — they keep their long absolute backoff timestamps.
+RETRY_LADDER_SEC = (5, 15, 30, 60)
 
 # Polling intervals. The OAuth usage endpoint is rate-limited to ~5 req per token,
 # but a fresh token is issued ~every 8h so we have a budget of ~5/8h = ~1 req per 90 min.
@@ -87,6 +104,16 @@ class Orchestrator:
         # Wake events let us trigger an immediate refresh outside the polling cadence.
         self._api_wake = threading.Event()
         self._jsonl_wake = threading.Event()
+        # Consecutive API-fetch failures — drives the fast-retry ladder. Only the
+        # api thread touches it, so no lock needed.
+        self._consecutive_failures = 0
+        # Seconds left on the refresh cooldown from the most recent cycle, set by
+        # _try_refresh and read by _next_api_wait for the cooldown-aware wait.
+        self._refresh_cooldown_left = 0.0
+        # Seed the UI with the last good snapshot from disk so quota shows up
+        # immediately (with an honest age) rather than blank until the first
+        # network fetch lands.
+        self._load_usage_cache()
 
     def start(self) -> None:
         self._stop.clear()
@@ -123,7 +150,47 @@ class Orchestrator:
                 alerted_7d=set(self.state.alerted_7d),
             )
 
+    # ---------- last-good snapshot persistence ----------
+
+    def _load_usage_cache(self) -> None:
+        """Seed state.usage from the on-disk last-good snapshot, if present and
+        valid. Corrupt / missing cache is ignored silently — it's only an
+        optimization, never a correctness dependency."""
+        try:
+            with open(USAGE_CACHE_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            raw = data["raw"]
+            fetched_at = float(data["fetched_at"])
+            if not isinstance(raw, dict):
+                return
+            snap = snapshot_from_body(raw, fetched_at)
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        # No lock needed: runs in __init__ before the threads start.
+        self.state.usage = snap
+        self.state.last_api_fetch = fetched_at
+        log.info("seeded usage from cache (age %ds)", int(time.time() - fetched_at))
+
+    def _save_usage_cache(self, snap: UsageSnapshot) -> None:
+        """Atomically persist the last good snapshot (tmp + Path.replace, same
+        crash-safe pattern as save_oauth_creds). Failures are non-fatal."""
+        try:
+            payload = json.dumps({"raw": snap.raw, "fetched_at": snap.fetched_at})
+            tmp = USAGE_CACHE_PATH.with_suffix(".json.tmp")
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.replace(USAGE_CACHE_PATH)
+        except OSError as e:
+            log.warning("failed to persist usage cache: %s", e)
+
     # ---------- background loops ----------
+
+    # Outcome codes returned by _do_fetch_cycle, consumed by _api_loop to pick
+    # the next wait. BACKOFF means an absolute backoff timestamp was already set
+    # (429 / invalid_grant) and the loop top will honor it — don't ladder.
+    _OUT_OK = "ok"
+    _OUT_RETRYABLE = "retryable"   # network error, or any failure pre-first-success
+    _OUT_BACKOFF = "backoff"       # absolute backoff already set (429 / invalid_grant)
+    _OUT_COOLDOWN = "cooldown"     # refresh on cooldown; self._refresh_cooldown_left set
 
     def _api_loop(self) -> None:
         while not self._stop.is_set():
@@ -137,27 +204,56 @@ class Orchestrator:
                 self._api_wake.clear()
                 continue
 
+            self._refresh_cooldown_left = 0.0
             try:
-                self._do_fetch_cycle()
+                outcome = self._do_fetch_cycle()
             except urllib.error.URLError as e:
                 self._record_api_error(f"network: {e.reason}")
+                outcome = self._OUT_RETRYABLE
             except (FileNotFoundError, ValueError) as e:
                 self._record_api_error(str(e))
+                # No creds / malformed creds: keep showing last-known data and
+                # retry on the fast ladder while usage is still unknown.
+                outcome = self._OUT_RETRYABLE if self.state.usage is None else self._OUT_OK
             except Exception as e:  # noqa: BLE001 — last-resort safety
                 self._record_api_error(f"{type(e).__name__}: {e}")
+                outcome = self._OUT_RETRYABLE if self.state.usage is None else self._OUT_OK
 
-            self._api_wake.wait(timeout=API_INTERVAL_SEC)
+            self._api_wake.wait(timeout=self._next_api_wait(outcome))
             self._api_wake.clear()
 
-    def _do_fetch_cycle(self) -> None:
+    def _next_api_wait(self, outcome: str) -> float:
+        """Compute the delay before the next fetch attempt from this cycle's
+        outcome and the consecutive-failure count (A2.3 / A2.4)."""
+        if outcome == self._OUT_OK:
+            self._consecutive_failures = 0
+            return API_INTERVAL_SEC
+        if outcome == self._OUT_COOLDOWN:
+            # Wake just after the refresh cooldown lapses so quota appears
+            # promptly, but never wait longer than the normal interval.
+            return min(max(self._refresh_cooldown_left, 0.0) + 2, API_INTERVAL_SEC)
+        if outcome == self._OUT_BACKOFF:
+            # 429 / invalid_grant set an absolute api_backoff_until; the loop top
+            # enforces it. Don't ladder; a normal-interval wait re-checks it.
+            return API_INTERVAL_SEC
+        # _OUT_RETRYABLE: climb the fast ladder, then cap at the normal interval.
+        idx = self._consecutive_failures
+        self._consecutive_failures += 1
+        if idx < len(RETRY_LADDER_SEC):
+            return RETRY_LADDER_SEC[idx]
+        return API_INTERVAL_SEC
+
+    def _do_fetch_cycle(self) -> str:
         """One full API fetch cycle: ensure token is valid (refresh if needed),
         call the usage endpoint, handle errors (with one retry after refresh
-        on 401), record state."""
+        on 401), record state. Returns an _OUT_* outcome code so _api_loop can
+        choose the next wait."""
         creds = load_oauth_creds()
         if creds.is_expired():
             creds = self._try_refresh()
             if creds is None:
-                return  # error already recorded; backoff already set if applicable
+                # error already recorded; backoff already set if applicable
+                return self._refresh_outcome()
 
         # First attempt
         try:
@@ -170,23 +266,33 @@ class Orchestrator:
                 log.info("API returned 401; attempting refresh + retry")
                 creds = self._try_refresh()
                 if creds is None:
-                    return
+                    return self._refresh_outcome()
                 try:
                     snap = fetch_usage(creds.access_token)
                 except urllib.error.HTTPError as e2:
-                    self._handle_api_http_error(e2)
-                    return
+                    return self._handle_api_http_error(e2)
             else:
-                self._handle_api_http_error(e)
-                return
+                return self._handle_api_http_error(e)
 
         # Success path
         with self._lock:
             self.state.usage = snap
             self.state.usage_error = ""
             self.state.last_api_fetch = time.time()
+        self._save_usage_cache(snap)
         self._check_thresholds(snap)
         self._on_change()
+        return self._OUT_OK
+
+    def _refresh_outcome(self) -> str:
+        """Map a failed _try_refresh into an outcome code. Cooldown gets the
+        cooldown-aware short wait; everything else (invalid_grant set absolute
+        backoff, or a transient refresh error) is retryable/backoff."""
+        if self._refresh_cooldown_left > 0:
+            return self._OUT_COOLDOWN
+        if self.state.api_backoff_until > time.time():
+            return self._OUT_BACKOFF
+        return self._OUT_RETRYABLE
 
     def _try_refresh(self) -> OAuthCreds | None:
         """Attempt OAuth refresh-and-save with rate-limiting. Returns new creds
@@ -194,6 +300,9 @@ class Orchestrator:
         now = time.time()
         cooldown_left = MIN_REFRESH_INTERVAL_SEC - (now - self.state.last_refresh_attempt)
         if cooldown_left > 0:
+            # Record how long the cooldown has left so _api_loop can wake right
+            # after it lapses (A2.4) instead of sleeping a full interval.
+            self._refresh_cooldown_left = cooldown_left
             self._record_api_error(
                 f"Token expired, refresh on cooldown ({int(cooldown_left)}s)")
             return None
@@ -232,14 +341,19 @@ class Orchestrator:
                  time.strftime("%H:%M:%S", time.localtime(new_creds.expires_at_unix)))
         return new_creds
 
-    def _handle_api_http_error(self, e: urllib.error.HTTPError) -> None:
-        """Record a usage-endpoint HTTP error and set backoff if appropriate."""
+    def _handle_api_http_error(self, e: urllib.error.HTTPError) -> str:
+        """Record a usage-endpoint HTTP error, set backoff if appropriate, and
+        return the outcome code for _api_loop's wait selection."""
         msg = f"HTTP {e.code}: {e.reason}"
         if e.code == 429:
             with self._lock:
                 self.state.api_backoff_until = time.time() + RATE_LIMIT_BACKOFF_SEC
             msg += f" (backing off {RATE_LIMIT_BACKOFF_SEC // 60} min)"
+            self._record_api_error(msg)
+            return self._OUT_BACKOFF
         self._record_api_error(msg)
+        # Non-429 HTTP error: ladder only while we still have nothing to show.
+        return self._OUT_RETRYABLE if self.state.usage is None else self._OUT_OK
 
     def _jsonl_loop(self) -> None:
         while not self._stop.is_set():

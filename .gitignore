@@ -7,6 +7,9 @@ __pycache__/
 
 # Per-user runtime state (strip position, etc) — not for source control
 config.json
+# Last-good usage snapshot persisted for fast startup display — runtime cache
+usage_cache.json
+usage_cache.json.tmp
 
 # IDE
 .vscode/

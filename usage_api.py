@@ -53,6 +53,19 @@ class UsageSnapshot:
     def seven_day_minutes_to_reset(self) -> int:
         return _minutes_until_iso(self.seven_day_reset)
 
+    @property
+    def five_hour_active(self) -> bool:
+        """True iff a 5h block is actually running. When no block is active the
+        endpoint returns utilization 0 with an empty/None resets_at; a non-empty
+        resets_at is the reliable signal that the window is live."""
+        return bool(self.five_hour_reset)
+
+    @property
+    def seven_day_active(self) -> bool:
+        """True iff the weekly window is live (non-empty resets_at). See
+        five_hour_active for the rationale."""
+        return bool(self.seven_day_reset)
+
 
 def _minutes_until_iso(iso_ts: str) -> int:
     """Minutes from now until an ISO 8601 timestamp. Returns 0 if past."""
@@ -186,6 +199,32 @@ def refresh_and_save(creds_path: Path = CREDENTIALS_PATH) -> OAuthCreds:
     return load_oauth_creds(creds_path)
 
 
+def snapshot_from_body(body: dict[str, Any], fetched_at: float) -> UsageSnapshot:
+    """Build a UsageSnapshot from a raw /api/oauth/usage response body.
+
+    Single parsing path shared by the live fetch and the on-disk last-snapshot
+    cache, so a snapshot reconstructed from `usage_cache.json` is byte-for-byte
+    equivalent to one parsed fresh from the network.
+    """
+    five = body.get("five_hour") or {}
+    seven = body.get("seven_day") or {}
+    seven_opus = body.get("seven_day_opus") or {}
+    seven_sonnet = body.get("seven_day_sonnet") or {}
+    extra = body.get("extra_usage") or {}
+
+    return UsageSnapshot(
+        five_hour_pct=float(five.get("utilization", 0) or 0),
+        five_hour_reset=five.get("resets_at", "") or "",
+        seven_day_pct=float(seven.get("utilization", 0) or 0),
+        seven_day_reset=seven.get("resets_at", "") or "",
+        seven_day_opus_pct=(float(seven_opus["utilization"]) if seven_opus.get("utilization") is not None else None),
+        seven_day_sonnet_pct=(float(seven_sonnet["utilization"]) if seven_sonnet.get("utilization") is not None else None),
+        extra_usage_enabled=bool(extra.get("is_enabled")),
+        fetched_at=fetched_at,
+        raw=body,
+    )
+
+
 def fetch_usage(token: str | None = None, *, user_agent: str = DEFAULT_UA) -> UsageSnapshot:
     """Fetch one snapshot from the /api/oauth/usage endpoint.
 
@@ -208,23 +247,7 @@ def fetch_usage(token: str | None = None, *, user_agent: str = DEFAULT_UA) -> Us
     with urllib.request.urlopen(req, timeout=10) as resp:
         body = json.loads(resp.read().decode("utf-8"))
 
-    five = body.get("five_hour") or {}
-    seven = body.get("seven_day") or {}
-    seven_opus = body.get("seven_day_opus") or {}
-    seven_sonnet = body.get("seven_day_sonnet") or {}
-    extra = body.get("extra_usage") or {}
-
-    return UsageSnapshot(
-        five_hour_pct=float(five.get("utilization", 0) or 0),
-        five_hour_reset=five.get("resets_at", ""),
-        seven_day_pct=float(seven.get("utilization", 0) or 0),
-        seven_day_reset=seven.get("resets_at", ""),
-        seven_day_opus_pct=(float(seven_opus["utilization"]) if seven_opus.get("utilization") is not None else None),
-        seven_day_sonnet_pct=(float(seven_sonnet["utilization"]) if seven_sonnet.get("utilization") is not None else None),
-        extra_usage_enabled=bool(extra.get("is_enabled")),
-        fetched_at=time.time(),
-        raw=body,
-    )
+    return snapshot_from_body(body, time.time())
 
 
 if __name__ == "__main__":
