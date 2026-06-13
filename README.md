@@ -35,7 +35,7 @@ You live in Claude Code all day. You keep hitting the 5-hour wall or the weekly 
 
 **ClaudeUsageMonitor pins the authoritative numbers to your taskbar and stays out of your way.** It reads the same OAuth token Claude Code already wrote to disk, calls Anthropic's own usage endpoint, and shows you exactly how close you are to the limit — before you slam into it.
 
-> **The trick:** it borrows Claude Code's local OAuth token at `~/.claude/.credentials.json` and refreshes it atomically when it expires. There is **no login screen anywhere in this app** — install it and it just works.
+> **The trick:** it *reads* Claude Code's local OAuth token at `~/.claude/.credentials.json` — and never writes it. There is **no login screen anywhere in this app** — install it and it just works.
 
 ---
 
@@ -51,9 +51,9 @@ Install and it just works, using the Claude Code session you already have. Nothi
 The 5-hour and weekly percentages are the *same authoritative numbers Claude Code uses*, and they include **all** of your subscription usage — Code **plus** chat/desktop/web — not a guess from local logs.
 > `fetch_usage` (`usage_api.py:189`) GETs `https://api.anthropic.com/api/oauth/usage` and reads `five_hour.utilization` / `seven_day.utilization` straight from the response. The endpoint is undocumented; the `User-Agent` must be `claude-code/2.0.0` or it lands in a tighter rate-limit bucket.
 
-### Automatic, atomic token refresh
-Tokens expire roughly every 8 hours, but under normal use you never have to `/login` again — refreshes happen silently and safely in the background.
-> `refresh_and_save` (`usage_api.py:170`) refreshes via `console.anthropic.com/v1/oauth/token`, then `save_oauth_creds` writes to a `.json.tmp` and `Path.replace()`s it (lines 145–167) — atomic, and every other credential field is preserved. `state.py` rate-limits refreshes to one per 5 min, and if the refresh token has rotated out from under it (`invalid_grant`) it backs off an hour and asks you to `/login` in Claude Code.
+### Read-only auth — it can never break your Claude Code login
+This monitor **never refreshes or writes** the OAuth token. The `refresh_token` in `~/.claude/.credentials.json` is shared with Claude Code and *rotates on every use*, so any process that refreshes it invalidates the other's copy — refreshing here once broke the user's Claude Code login. So we don't. We read whatever access token Claude Code currently maintains; when it expires, we **wait for Claude Code to rotate it** (which it does on its own next use) and pick up the fresh token automatically — meanwhile the quota is clearly marked **stale** rather than shown as live.
+> `_do_fetch_cycle` (`state.py`) only ever calls `load_oauth_creds` (a disk read) + `fetch_usage` (a GET). On an expired/401 token it sets `token_expired` and re-checks the disk every `TOKEN_RECHECK_SEC` (45 s, no network) so it recovers within seconds of your next Claude Code use. Nothing in the app writes `credentials.json`.
 
 ### Always-visible taskbar strip
 A tiny borderless readout sits right on the Windows taskbar, so your quota is glanceable without opening anything.
@@ -98,9 +98,9 @@ Even with no windows open, the system-tray badge tells you your 5-hour usage at 
 Switch between English and Chinese, toggle autostart, and choose strip side / opacity / display mode — all from one **tray → Settings** window (General / Strip / About), not buried tray submenus.
 > `LANGUAGES` holds `en` and `zh` dicts driving every visible string; `SettingsWindow` (`app.py`) is a dark-themed `Toplevel` with a custom segmented tab bar. It offers the language picker, the **Run at startup** checkbox, strip side (left/right), opaque background, and four display modes (compact / +time-remaining / +time-remaining% / +time-elapsed%). Live changes apply immediately and persist to `config.json`.
 
-### Boots instantly, runs once
-The window shows your last-known quota the moment it opens — even before the first network call — and only one copy ever runs.
-> A single-instance named mutex makes a second launch exit quietly (`main()`). The last good snapshot is cached to `usage_cache.json` and seeded on startup, with a fast-retry ladder so fresh numbers land quickly once connectivity (or a token refresh) clears.
+### Boots instantly, never silently freezes
+The window shows your last-known quota the moment it opens — even before the first network call — and only one copy ever runs. If the data pipeline ever stalls (expired token, dead network), the quota is greyed and marked **stale** with its age, so it reads as *old data*, never as a frozen app.
+> A single-instance named mutex makes a second launch exit quietly (`main()`). The last good snapshot is cached to `usage_cache.json` and seeded on startup, with a fast-retry ladder so fresh numbers land quickly once connectivity clears. Both repaint loops reschedule in `finally` (an exception can't kill the chain), every Settings PowerShell call runs off the main thread, and a rotating file log (`cc-usage-tray.log`) captures diagnostics that `pythonw.exe` would otherwise discard.
 
 ---
 
@@ -160,10 +160,9 @@ The endpoint is rate-limited at ~5 requests/token, so we poll it every **6 minut
 
 ```mermaid
 flowchart LR
-    A[Claude Code<br/>writes token] -->|~/.claude/.credentials.json| B[usage_api.py<br/>load_oauth_creds]
+    A[Claude Code<br/>writes + rotates token] -->|~/.claude/.credentials.json| B[usage_api.py<br/>load_oauth_creds · read-only]
     B -->|Bearer token<br/>UA: claude-code/2.0.0| C[/api/oauth/usage<br/>poll 6 min/]
-    B -.->|expired?| R[refresh_and_save<br/>atomic write-back]
-    R -.-> A
+    B -.->|expired? wait for CC,<br/>never refresh| B
     C --> D[state.py<br/>Orchestrator]
     E[~/.claude/projects/**.jsonl] -->|parse 30 s| F[jsonl_costs.py<br/>build_report]
     F --> D
@@ -198,6 +197,7 @@ Read these before you rely on the numbers. They are deliberate, not bugs.
 - **Exclusive-fullscreen games/apps render above everything in user space**, so the strip is hidden while one is in front. Use borderless-windowed mode to keep it visible.
 - **Windows 10/11 only.** Despite the credentials path existing on macOS/Linux, the entire UI is Windows-specific (ctypes/user32, taskbar pinning, `winotify` toasts, a PowerShell-path fix for toast delivery). It is **not** cross-platform.
 - **Requires an existing Claude Code login.** The app has no login of its own; it relies on `~/.claude/.credentials.json` already being there.
+- **Quota goes *stale*, never wrong, when the token expires.** Because the app never refreshes the shared token (doing so could break your Claude Code login), the access token only renews when **Claude Code itself** uses it. If you don't touch Claude Code for ~8 h (e.g. overnight), the token expires and the quota freezes — but it's clearly **greyed and marked stale with its age**, and snaps back to live within ~45 s the next time you use Claude Code. Stale ≠ frozen app.
 - **It relies on an undocumented endpoint and a spoofed User-Agent.** This is not an official or supported Anthropic integration — Anthropic could change the `/api/oauth/usage` endpoint or the `claude-code/2.0.0` UA expectation at any time and break the quota readout.
 
 ---
@@ -205,10 +205,11 @@ Read these before you rely on the numbers. They are deliberate, not bugs.
 ## Architecture
 
 ```
-usage_api.py     OAuth token loader + /api/oauth/usage HTTP client + atomic refresh/save.
+usage_api.py     OAuth token loader (READ-ONLY) + /api/oauth/usage HTTP client.
 jsonl_costs.py   JSONL parser + cost aggregator (two-tier cache pricing table inline).
 state.py         Two daemon threads: API poll (6 min) and JSONL parse (30 s).
-                 Threshold-cross alerts fire once per crossing per window; refresh backoff.
+                 Read-only auth: never refreshes the shared token; marks data
+                 stale when it expires. Threshold alerts fire once per crossing.
 app.py           Entry point: tkinter FloatingWindow + pystray tray icon + TaskbarStrip.
                  Strip uses a 3-mechanism topmost defense to stay on top of the Win11 shell.
 ```

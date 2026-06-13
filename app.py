@@ -79,6 +79,10 @@ LANGUAGES: dict[str, dict[str, str]] = {
         # fragments live here so they translate.
         "resets_at": "resets at {time} · {left} left",  # {time}=HH:MM, {left}=2h 13m
         "updated_ago": "updated {age} ago",
+        # ---- Staleness / token-expired state ----
+        "stale_mark": "stale",                            # short strip marker
+        "stale_token": "Sign-in expired — open Claude Code to refresh quota",
+        "stale_generic": "Quota data stale · {age} old",
         # ---- Settings window ----
         "settings_title": "Settings",
         "tab_general": "General",
@@ -147,6 +151,10 @@ LANGUAGES: dict[str, dict[str, str]] = {
         "sonnet": "Sonnet",
         "resets_at": "{time} 重置 · 剩 {left}",
         "updated_ago": "{age}前更新",
+        # ---- Staleness / token-expired state ----
+        "stale_mark": "数据旧",
+        "stale_token": "登录已过期 · 用一下 Claude Code 即可刷新配额",
+        "stale_generic": "配额数据已过期 · {age}前",
         # ---- Settings window ----
         "settings_title": "设置",
         "tab_general": "常规",
@@ -199,6 +207,32 @@ def get_app_language() -> str:
 # % of total window" for display mode 3.
 TOTAL_5H_MIN = 5 * 60
 TOTAL_7D_MIN = 7 * 24 * 60
+
+# The quota snapshot is considered STALE once it's older than this. A healthy
+# pipeline refreshes every API_INTERVAL_SEC (360s); 900s = ~2.5 missed polls, so
+# a single failed-then-retried poll never trips it, but a genuinely stalled
+# pipeline (expired token waiting for Claude Code, dead network) shows up clearly.
+# When stale, the strip greys the quota and appends a marker so a future stall
+# reads as "old data", never as a frozen/broken app.
+STALE_AFTER_SEC = 900
+
+
+def usage_age_seconds(last_api_fetch: float) -> int:
+    """Seconds since the last successful quota fetch, or -1 if none yet."""
+    if not last_api_fetch:
+        return -1
+    import time as _t
+    return int(_t.time() - last_api_fetch)
+
+
+def is_usage_stale(s) -> bool:
+    """True when the displayed quota is old enough to flag — either the data has
+    aged past STALE_AFTER_SEC, or the token is known-expired (we never refresh it
+    ourselves; see state._do_fetch_cycle)."""
+    if getattr(s, "token_expired", False):
+        return True
+    age = usage_age_seconds(s.last_api_fetch)
+    return age < 0 or age > STALE_AFTER_SEC
 
 
 # ---- Visual constants (dark theme) ----
@@ -837,13 +871,15 @@ class FloatingWindow:
             self.on_close()
 
     def _tick(self) -> None:
+        # Reschedule in `finally` so a render exception can never break the chain
+        # (same hardening as the strip — see TaskbarStrip._tick).
         try:
             self._render(self.orch.snapshot())
         except Exception:
-            log = logging.getLogger(__name__)
-            log.exception("render failed")
-        # Repaint every second so the "resets in Xm" countdown updates live.
-        self.root.after(1000, self._tick)
+            logging.getLogger(__name__).exception("window render failed")
+        finally:
+            # Repaint every second so the "resets in Xm" countdown updates live.
+            self.root.after(1000, self._tick)
 
     # ---- per-tick bar drawing with last-value cache ----
 
@@ -866,6 +902,7 @@ class FloatingWindow:
     def _render(self, s) -> None:
         u: UsageSnapshot | None = s.usage
         rpt = s.report
+        stale = u is not None and is_usage_stale(s)
 
         # --- Quota rows ---
         for key, getters in (
@@ -887,9 +924,14 @@ class FloatingWindow:
             minutes = getters[1]()
             active = getters[2]()
             reset_iso = getters[3]()
-            color = color_for_pct(pct)
+            # Stale data: grey the percentage and show a stale caption rather than
+            # a reset countdown computed from a stale resets_at (which would be
+            # past and misleading). The footer carries the actionable hint.
+            color = FG_DIM if stale else color_for_pct(pct)
             w["pct"].config(text=f"{pct:.0f}%", fg=color)
-            if active:
+            if stale:
+                w["caption"].config(text=t("stale_mark"), fg=WARN)
+            elif active:
                 clock = fmt_reset_clock(reset_iso)
                 if clock:
                     cap = t("resets_at").format(time=clock, left=fmt_minutes(minutes))
@@ -899,7 +941,7 @@ class FloatingWindow:
                 w["caption"].config(text=cap, fg=FG_DIM)
             else:
                 w["caption"].config(text=t("idle_full"), fg=FG_DIM)
-            self._draw_bar(key, w["bar"], pct, color, 8)
+            self._draw_bar(key, w["bar"], pct, color if not stale else BORDER, 8)
 
         # 7d Opus/Sonnet sub-rows — shown only when present.
         sub_specs = (
@@ -960,11 +1002,20 @@ class FloatingWindow:
                 self._bar_cache.pop(f"proj{i}", None)
 
         # --- Footer ---
-        if s.usage_error:
+        age = usage_age_seconds(s.last_api_fetch)
+        if stale:
+            # Actionable: token-expired says exactly what to do (use Claude Code,
+            # which rotates the shared token we deliberately never refresh); other
+            # stale causes (network, 429) show a generic stale + age line.
+            if getattr(s, "token_expired", False):
+                self.footer.config(text=t("stale_token"), fg=WARN)
+            else:
+                self.footer.config(
+                    text=t("stale_generic").format(age=fmt_age(age) if age >= 0 else "—"),
+                    fg=WARN)
+        elif s.usage_error and u is None:
             self.footer.config(text=s.usage_error[:60], fg=DANGER)
         else:
-            import time as _t
-            age = int(_t.time() - s.last_api_fetch) if s.last_api_fetch else -1
             self.footer.config(
                 text=(t("updated_ago").format(age=fmt_age(age)) if age >= 0 else ""),
                 fg=FG_DIM)
@@ -1382,25 +1433,30 @@ class TaskbarStrip:
             self._menu.grab_release()
 
     def _tick(self) -> None:
+        # The reschedule MUST be unconditional — it lives in `finally` so that NO
+        # exception in render/_reposition/_is_covered/_force_topmost can ever kill
+        # this self-rescheduling chain. A dead chain = a permanently frozen strip
+        # (mainloop keeps running, but nothing repaints), which is exactly the
+        # kind of "卡死" we must make structurally impossible.
         try:
             self._render(self.orch.snapshot())
+            if self.visible:
+                self._tick_count += 1
+                self._reposition()
+                # Topmost policy (A3): only do the disruptive off→on toggle when we
+                # actually detect we're covered (post-Settings/Quick-Settings flyout,
+                # post-autostart shell init). When already on top, a periodic
+                # non-disruptive SetWindowPos(HWND_TOPMOST) reassert — no toggle —
+                # defends z-order without risking the blink the toggle could cause.
+                if self._is_covered():
+                    self._force_topmost()
+                    self._force_topmost_winapi()
+                elif self._tick_count % 20 == 0:
+                    self._force_topmost_winapi()
         except Exception:
-            logging.getLogger(__name__).exception("strip render failed")
-        if self.visible:
-            self._tick_count += 1
-            self._reposition()
-            # Topmost policy (A3): only do the disruptive off→on toggle when we
-            # actually detect we're covered (post-Settings/Quick-Settings flyout,
-            # post-autostart shell init). When we're already on top, a periodic
-            # non-disruptive reassert via SetWindowPos(HWND_TOPMOST) — no toggle —
-            # is enough to defend z-order without ever risking the blink the
-            # toggle could cause.
-            if self._is_covered():
-                self._force_topmost()
-                self._force_topmost_winapi()
-            elif self._tick_count % 20 == 0:
-                self._force_topmost_winapi()
-        self.win.after(1000, self._tick)
+            logging.getLogger(__name__).exception("strip tick failed")
+        finally:
+            self.win.after(1000, self._tick)
 
     # Outline offsets — 4 cardinal directions, 1px out. (Diagonals add 4 more
     # canvas items per glyph but visually almost no improvement; 4-way is the
@@ -1420,7 +1476,7 @@ class TaskbarStrip:
 
     def _append_quota_parts(self, parts: list, label_key: str, quota_pct: float,
                             mins_remaining: int, total_window_min: int,
-                            active: bool = True) -> None:
+                            active: bool = True, stale: bool = False) -> None:
         """Append the (text, color, font) pieces for one quota's display in the
         currently selected display_mode. Caller is responsible for any leading
         separator. Pieces are appended in reading order (caller packs left-to-right
@@ -1429,11 +1485,16 @@ class TaskbarStrip:
         When `active` is False (no live window — the endpoint reports 0% with no
         resets_at), render just the quota% regardless of display_mode and skip
         the time suffix entirely: "(0m)" / "/0%" / "/100%" would all be lies.
+
+        When `stale` is True the data is old (pipeline stalled / token expired):
+        grey the quota out and drop the time suffix — the elapsed/remaining parts
+        would be computed from a stale resets_at and are meaningless. The caller
+        appends a visible "stale" marker so the greying isn't ambiguous.
         """
         parts.append((t(label_key) + " ", FG_DIM, self.font_dim))
-        quota_color = color_for_pct(quota_pct)
-        if not active or self.display_mode == 1:
-            # Inactive (or compact mode 1): just the quota%
+        quota_color = FG_DIM if stale else color_for_pct(quota_pct)
+        if stale or not active or self.display_mode == 1:
+            # Stale / inactive / compact mode 1: just the quota%
             parts.append((f"{quota_pct:.0f}%", quota_color, self.font_main))
         elif self.display_mode == 2:
             # Mode 2: quota% (time remaining)
@@ -1468,20 +1529,30 @@ class TaskbarStrip:
         # Build the ordered list of (text, color, font) pieces. Caption pieces
         # use FG_DIM; value pieces use the threshold-based color. Layout depends
         # on the current display_mode (selected from the tray Settings submenu).
+        stale = u is not None and is_usage_stale(s)
         parts: list[tuple[str, str, tkfont.Font]] = []
         if u is not None:
             self._append_quota_parts(parts, "5h", u.five_hour_pct,
                                      u.five_hour_minutes_to_reset, TOTAL_5H_MIN,
-                                     active=u.five_hour_active)
+                                     active=u.five_hour_active, stale=stale)
             parts.append(("   ·   ", FG_DIM, self.font_dim))
             self._append_quota_parts(parts, "7d", u.seven_day_pct,
                                      u.seven_day_minutes_to_reset, TOTAL_7D_MIN,
-                                     active=u.seven_day_active)
+                                     active=u.seven_day_active, stale=stale)
         if rpt is not None:
             if u is not None:
                 parts.append(("   ·   ", FG_DIM, self.font_dim))
             parts.append((t("today") + " ", FG_DIM, self.font_dim))
             parts.append((f"${rpt.today.cost_usd:,.2f}", FG, self.font_main))
+        if stale:
+            # An unmistakable, glanceable marker (orange) so greyed quota numbers
+            # read as "old data" — never as a frozen app. Include the age.
+            age = usage_age_seconds(s.last_api_fetch)
+            mark = t("stale_mark")
+            if age >= 0:
+                mark = f"{mark} {fmt_age(age)}"
+            parts.append(("   ·   ", FG_DIM, self.font_dim))
+            parts.append((mark, WARN, self.font_dim))
         if not parts:
             return  # nothing to draw yet (initial state before first data lands)
 
@@ -1723,6 +1794,31 @@ class SettingsWindow:
         btn.pack(anchor="w", pady=4)
         return btn
 
+    def _run_async(self, work: callable, on_done: callable) -> None:
+        """Run blocking work() on a daemon thread, then deliver its result to
+        on_done() on the tk main thread. Used so the autostart PowerShell calls
+        (which can take seconds) never run on the main thread and freeze the UI.
+        Safely no-ops if the settings window is gone by the time work finishes."""
+        def runner() -> None:
+            try:
+                result = work()
+            except Exception:
+                logging.getLogger(__name__).exception("settings async work failed")
+                result = None
+
+            def deliver() -> None:
+                if not self._alive():
+                    return
+                try:
+                    on_done(result)
+                except Exception:
+                    logging.getLogger(__name__).exception("settings async on_done failed")
+            try:
+                self.win.after(0, deliver)
+            except (tk.TclError, RuntimeError):
+                pass
+        threading.Thread(target=runner, name="settings-async", daemon=True).start()
+
     # ---- Tab 1: General ----
 
     def _build_general(self) -> tk.Frame:
@@ -1738,11 +1834,16 @@ class SettingsWindow:
         self._radio(inner, t("lang_en"), self.lang_var, "en", self._on_lang)
         self._radio(inner, t("lang_zh"), self.lang_var, "zh", self._on_lang)
 
-        # Run at startup
+        # Run at startup. Both the detection and the toggle shell out to
+        # PowerShell (per .lnk in the Startup folder), which can take seconds —
+        # so they run OFF the main thread. The checkbox starts disabled and is
+        # enabled once the async detection returns; opening Settings never blocks.
         self._section(inner, t("run_at_startup"))
-        self.startup_var = tk.BooleanVar(value=is_autostart_enabled())
-        self._checkbox(inner, t("run_at_startup"), self.startup_var,
-                       self._on_startup_toggle)
+        self.startup_var = tk.BooleanVar(value=False)
+        self.startup_cb = self._checkbox(inner, t("run_at_startup"),
+                                         self.startup_var, self._on_startup_toggle)
+        self.startup_cb.config(state="disabled")
+        self._run_async(is_autostart_enabled, self._apply_startup_detected)
 
         # Version + project page
         self._section(inner, t("version_label"))
@@ -1761,12 +1862,33 @@ class SettingsWindow:
         except Exception:
             logging.getLogger(__name__).exception("on_lang_change failed")
 
+    def _apply_startup_detected(self, enabled) -> None:
+        """Async callback: reflect the detected autostart state and re-enable the
+        checkbox (it was disabled while the PowerShell scan ran off-thread)."""
+        self.startup_var.set(bool(enabled))
+        try:
+            self.startup_cb.config(state="normal")
+        except tk.TclError:
+            pass
+
     def _on_startup_toggle(self) -> None:
         want = bool(self.startup_var.get())
-        ok = create_autostart_entry() is not None if want else remove_autostart_entry()
-        if not ok:
-            # Revert the checkbox to reflect reality; never crash.
-            self.startup_var.set(not want)
+        # create/remove also shell out to PowerShell — run off-thread, and lock
+        # the checkbox until it completes so a fast double-click can't race.
+        try:
+            self.startup_cb.config(state="disabled")
+        except tk.TclError:
+            pass
+        work = (lambda: create_autostart_entry() is not None) if want else remove_autostart_entry
+
+        def done(ok) -> None:
+            if not ok:
+                self.startup_var.set(not want)  # revert to reflect reality
+            try:
+                self.startup_cb.config(state="normal")
+            except tk.TclError:
+                pass
+        self._run_async(work, done)
 
     def _on_project_page(self) -> None:
         try:
@@ -2001,11 +2123,32 @@ def notify(kind: str, pct: float) -> None:
         logging.getLogger(__name__).warning("toast failed: %s", e)
 
 
+def _setup_logging() -> None:
+    """Console + rotating FILE logging. pythonw.exe has no stderr, so without a
+    file handler every diagnostic (orchestrator warnings, tick-callback
+    tracebacks routed via report_callback_exception) is silently lost — which is
+    exactly why the last freeze had to be diagnosed externally with py-spy. Keep
+    it small and self-rotating (3 x 512KB) next to the script."""
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+    sh = logging.StreamHandler()          # no-op under pythonw; handy via python.exe
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+    try:
+        from logging.handlers import RotatingFileHandler
+        log_path = Path(__file__).with_name("cc-usage-tray.log")
+        fh = RotatingFileHandler(log_path, maxBytes=512 * 1024, backupCount=3,
+                                 encoding="utf-8")
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+    except OSError as e:
+        root.warning("file logging unavailable: %s", e)
+
+
 def main() -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
+    _setup_logging()
+    logging.getLogger(__name__).info("cc-usage-tray v%s starting", __version__)
 
     # Single-instance guard. A named mutex in the Local namespace is per-session;
     # if it already exists another copy of us is running (common when autostart
@@ -2030,6 +2173,15 @@ def main() -> int:
     orch = Orchestrator()
     # Wire callbacks AFTER constructing window+tray so we can reference them.
     window = FloatingWindow(orch, on_close=lambda: None)
+
+    # Route tkinter callback exceptions to the log file. The periodic tick chains
+    # already guard + reschedule in finally, but one-off event handlers (clicks,
+    # binds, menu commands) surface their exceptions here — capture them so the
+    # next incident is diagnosable from the log rather than needing py-spy.
+    def _report_cb_exc(exc, val, tb) -> None:
+        logging.getLogger("tkinter").error(
+            "uncaught callback exception", exc_info=(exc, val, tb))
+    window.root.report_callback_exception = _report_cb_exc
 
     # Strip's right-click "Settings…" opens the same singleton SettingsWindow as
     # the tray; relabel the strip on a language change made from there.

@@ -10,6 +10,9 @@ config.json
 # Last-good usage snapshot persisted for fast startup display — runtime cache
 usage_cache.json
 usage_cache.json.tmp
+# Rotating runtime log (pythonw has no stderr) — diagnostics only
+cc-usage-tray.log
+cc-usage-tray.log.*
 
 # IDE
 .vscode/
