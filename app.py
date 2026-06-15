@@ -1062,36 +1062,53 @@ class TaskbarStrip:
         raw_side = cfg.get("side", STRIP_SIDE)
         self.side = raw_side if raw_side in ("left", "right") else STRIP_SIDE
 
-        self.win = tk.Toplevel(parent_root)
-        self.win.overrideredirect(True)         # no title bar / borders
-        self.win.attributes("-topmost", True)   # above normal app windows
-        self.win.attributes("-toolwindow", True)  # hide from Alt+Tab
-        # Transparent backdrop: any pixel matching TRANSPARENT_KEY becomes fully
-        # see-through on Windows. Both the Toplevel and the Canvas use this key
-        # color as their background, so only the drawn text + outline remain.
-        self.win.configure(bg=TRANSPARENT_KEY)
-        self.win.attributes("-transparentcolor", TRANSPARENT_KEY)
-
-        # Strip width is dynamic — grown/shrunk to fit the rendered text each tick.
-        self.strip_w = STRIP_W
-
-        # Last rendered content signature for the anti-flicker short-circuit in
-        # _render. None forces the next render. Setters that change appearance in
-        # ways the signature might not capture reset this to None for safety.
-        self._render_sig: tuple | None = None
-        # Last geometry actually applied by _reposition — lets us skip redundant
-        # geometry() calls (each one can momentarily disturb the strip).
-        self._applied_geom: tuple[int, int, int] | None = None
-        # Tick counter for the periodic non-disruptive topmost reassert (A3).
-        self._tick_count = 0
-
-        # Font instances (not just tuples) so we can call .measure() during layout.
+        # Font instances (not just tuples) so we can call .measure() during
+        # layout. They're interpreter-level and survive a window teardown, so
+        # create them once here rather than per-window.
         self.font_main = tkfont.Font(family="Segoe UI Semibold", size=9)
         self.font_dim = tkfont.Font(family="Segoe UI", size=9)
 
-        # Single Canvas replaces the old Frame+Labels arrangement. Canvas lets us
-        # draw outlined text manually (tkinter Labels can't do strokes) and
-        # combined with -transparentcolor produces a "floating text" look.
+        # Keep the parent so the tick loop can REBUILD the strip window if an
+        # external event destroys it out from under us (see _create_window).
+        self._parent_root = parent_root
+        self._create_window()
+        # Validate saved drag position before first paint: only catches *truly
+        # off-screen* positions (a now-disconnected monitor, or a shrunk
+        # resolution). Taskbar overlap is fine — _is_covered() + the topmost
+        # burst handle z-order contention.
+        self._validate_custom_pos()
+        self._reposition()
+        self._tick()
+
+    def _create_window(self) -> None:
+        """Build — or REBUILD — the strip's Toplevel + canvas + bindings + menu.
+
+        Called at init, and again by the tick self-heal when the window has been
+        destroyed by an external shell/session event. A borderless, topmost,
+        transparent (overrideredirect + -transparentcolor) Toplevel is exactly
+        the kind of window Windows tears down on a remote-desktop session switch
+        (RDP / RustDesk), a display/DPI change, or an explorer.exe restart —
+        leaving self.win dangling ("bad window path name"). Rebuilding restores
+        the strip within ~1 s, no restart needed.
+        """
+        self.win = tk.Toplevel(self._parent_root)
+        self.win.overrideredirect(True)          # no title bar / borders
+        self.win.attributes("-topmost", True)    # above normal app windows
+        self.win.attributes("-toolwindow", True)  # hide from Alt+Tab
+        # Transparent backdrop: any pixel matching TRANSPARENT_KEY becomes fully
+        # see-through; only the drawn text + outline remain.
+        self.win.configure(bg=TRANSPARENT_KEY)
+        self.win.attributes("-transparentcolor", TRANSPARENT_KEY)
+
+        # Per-window render/layout state — reset for the fresh window.
+        self.strip_w = STRIP_W
+        self._render_sig: tuple | None = None
+        self._applied_geom: tuple[int, int, int] | None = None
+        self._tick_count = 0
+
+        # Single Canvas lets us draw outlined text manually (tkinter Labels can't
+        # do strokes); combined with -transparentcolor it gives the "floating
+        # text" look.
         self.canvas = tk.Canvas(
             self.win, bg=TRANSPARENT_KEY,
             highlightthickness=0, borderwidth=0,
@@ -1099,37 +1116,37 @@ class TaskbarStrip:
         )
         self.canvas.pack(fill="both", expand=True)
 
-        # Click bindings only need the canvas — outlined text covers most pixels,
-        # and clicks on the transparent gaps fall through to whatever's behind
-        # (usually the taskbar, where missing the strip is harmless).
+        # Click bindings on both canvas and window — outlined text covers most
+        # pixels; clicks in transparent gaps fall through harmlessly.
         for widget in (self.canvas, self.win):
             widget.bind("<Button-1>", self._on_btn1_press)
             widget.bind("<B1-Motion>", self._on_btn1_motion)
             widget.bind("<ButtonRelease-1>", self._on_btn1_release)
             widget.bind("<Button-3>", self._on_right_click)
 
-        # Right-click context menu. Entries are (re)populated on each popup via
-        # _rebuild_menu so labels follow the current UI language (tk.Menu labels
-        # are static once added, unlike pystray's callable text).
+        # Right-click menu; entries (re)populated on each popup via _rebuild_menu
+        # so labels follow the current UI language.
         self._menu = tk.Menu(self.win, tearoff=0, bg=PANEL, fg=FG,
                              activebackground=ACCENT, activeforeground="white",
                              borderwidth=0)
 
-        # Validate saved drag position before first paint: only catches
-        # *truly off-screen* positions (previous run was on a now-disconnected
-        # monitor, or screen resolution shrank). Taskbar overlap is fine —
-        # the _is_covered() + force-topmost burst handles z-order contention.
-        self._validate_custom_pos()
+        # Preserve hidden state across a rebuild.
+        if not self.visible:
+            self.win.withdraw()
 
+        # (Re)assert position + topmost. The burst counters post-create races:
+        # the shell still settling at boot, or the taskbar reclaiming topmost
+        # right after a session switch.
         self._reposition()
-        self._tick()
-        # Startup burst: schedule extra force-topmost calls during the first
-        # ~10 seconds. Counters the autostart race where the Win11 shell
-        # finishes initializing after us and shoves the taskbar's HWND_TOPMOST
-        # window above ours. Once the system is settled, the per-tick bump +
-        # _is_covered() escalation handles ongoing z-order contention.
         for delay_ms in (300, 700, 1500, 3000, 6000, 10000):
             self.win.after(delay_ms, self._startup_bump)
+
+    def _win_alive(self) -> bool:
+        """True if the strip's Toplevel still exists (wasn't torn down externally)."""
+        try:
+            return bool(self.win.winfo_exists())
+        except tk.TclError:
+            return False
 
     def _validate_custom_pos(self) -> None:
         """Snap a saved position back on-screen if it's fully off-screen (e.g.
@@ -1171,6 +1188,8 @@ class TaskbarStrip:
         # show() reasserts explicitly. Calling _force_topmost() every tick from
         # here was the source of the occasional blink: its off→on toggle could
         # momentarily drop the strip behind the taskbar.
+        if not self._win_alive():
+            return  # window torn down; the tick self-heal will rebuild it
         drag_active = self.drag_mode and self._drag_anchor is not None
         if drag_active:
             return
@@ -1288,16 +1307,27 @@ class TaskbarStrip:
 
     def show(self) -> None:
         self.visible = True
+        # Resurrect immediately if an external event destroyed the window while
+        # it was hidden — otherwise show() would raise "bad window path name".
+        if not self._win_alive():
+            self._create_window()
         # Force geometry to be re-applied after a hide/show cycle.
         self._applied_geom = None
         self._reposition()
-        self.win.deiconify()
+        try:
+            self.win.deiconify()
+        except tk.TclError:
+            return
         # _reposition() no longer bumps topmost (A3) — do it explicitly here.
         self._force_topmost()
 
     def hide(self) -> None:
         self.visible = False
-        self.win.withdraw()
+        if self._win_alive():
+            try:
+                self.win.withdraw()
+            except tk.TclError:
+                pass
 
     def _on_show_window(self) -> None:
         """Menu command — always opens the main window regardless of drag mode."""
@@ -1433,12 +1463,21 @@ class TaskbarStrip:
             self._menu.grab_release()
 
     def _tick(self) -> None:
-        # The reschedule MUST be unconditional — it lives in `finally` so that NO
-        # exception in render/_reposition/_is_covered/_force_topmost can ever kill
-        # this self-rescheduling chain. A dead chain = a permanently frozen strip
-        # (mainloop keeps running, but nothing repaints), which is exactly the
-        # kind of "卡死" we must make structurally impossible.
+        # The reschedule MUST be unconditional — it lives in `finally` AND fires
+        # on the ROOT window (not self.win), so that NO exception, and not even a
+        # destroyed strip window, can kill this self-rescheduling chain. A dead
+        # chain = a permanently frozen/missing strip, which we make structurally
+        # impossible.
         try:
+            if not self._win_alive():
+                # An external event (RDP/RustDesk session switch, display/DPI
+                # change, explorer restart) tore the window down. Rebuild it —
+                # this is the strip's self-heal and is why it comes back on its
+                # own now instead of staying gone until a restart.
+                logging.getLogger(__name__).warning(
+                    "strip window vanished (external session/display event?); "
+                    "recreating")
+                self._create_window()
             self._render(self.orch.snapshot())
             if self.visible:
                 self._tick_count += 1
@@ -1456,7 +1495,13 @@ class TaskbarStrip:
         except Exception:
             logging.getLogger(__name__).exception("strip tick failed")
         finally:
-            self.win.after(1000, self._tick)
+            # Reschedule on the ROOT, never on self.win — the strip window may be
+            # destroyed (that's the bug we're healing); the root persists for the
+            # life of the app, so the heal loop always survives.
+            try:
+                self._parent_root.after(1000, self._tick)
+            except tk.TclError:
+                pass
 
     # Outline offsets — 4 cardinal directions, 1px out. (Diagonals add 4 more
     # canvas items per glyph but visually almost no improvement; 4-way is the
