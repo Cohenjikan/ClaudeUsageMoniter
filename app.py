@@ -34,7 +34,7 @@ from jsonl_costs import Aggregate
 from state import Orchestrator
 from usage_api import UsageSnapshot
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # Project home page — shown/opened from the Settings → General tab.
 PROJECT_URL = "https://github.com/Cohenjikan/ClaudeUsageMoniter"
@@ -73,15 +73,16 @@ LANGUAGES: dict[str, dict[str, str]] = {
         "cost_caption": "Equivalent API cost — Claude Code only",
         "loading": "loading…",
         "idle_full": "idle (full quota)",
-        "opus": "Opus",
-        "sonnet": "Sonnet",
+        # Model-scoped weekly buckets (Fable, …) — {name} is the server-provided
+        # model display name, deliberately untranslated.
+        "lbl_model_weekly": "{name} weekly",
         # Captions with runtime values are built via helpers, but the static
         # fragments live here so they translate.
         "resets_at": "resets at {time} · {left} left",  # {time}=HH:MM, {left}=2h 13m
         "updated_ago": "updated {age} ago",
         # ---- Staleness / token-expired state ----
         "stale_mark": "stale",                            # short strip marker
-        "stale_token": "Sign-in expired — open Claude Code to refresh quota",
+        "stale_token": "Sign-in refresh failed - open Claude Code if this persists",
         "stale_generic": "Quota data stale · {age} old",
         # ---- Settings window ----
         "settings_title": "Settings",
@@ -114,6 +115,7 @@ LANGUAGES: dict[str, dict[str, str]] = {
         # ---- Toast notifications ----
         "toast_5h_window": "5-hour window",
         "toast_weekly": "Weekly quota",
+        "toast_model_weekly": "{name} weekly quota",
         "toast_title": "Claude {window} at {pct}%",
         "toast_body_default": "Heads up — you may want to slow down or switch projects.",
         "toast_body_90": "Approaching the limit. Plan accordingly.",
@@ -147,13 +149,12 @@ LANGUAGES: dict[str, dict[str, str]] = {
         "cost_caption": "等效 API 成本（仅 Claude Code）",
         "loading": "加载中…",
         "idle_full": "空闲 · 满额可用",
-        "opus": "Opus",
-        "sonnet": "Sonnet",
+        "lbl_model_weekly": "{name} 周配额",
         "resets_at": "{time} 重置 · 剩 {left}",
         "updated_ago": "{age}前更新",
         # ---- Staleness / token-expired state ----
         "stale_mark": "数据旧",
-        "stale_token": "登录已过期 · 用一下 Claude Code 即可刷新配额",
+        "stale_token": "登录刷新失败 · 若持续请打开 Claude Code",
         "stale_generic": "配额数据已过期 · {age}前",
         # ---- Settings window ----
         "settings_title": "设置",
@@ -185,6 +186,7 @@ LANGUAGES: dict[str, dict[str, str]] = {
         # ---- Toast notifications ----
         "toast_5h_window": "5 小时窗口",
         "toast_weekly": "每周配额",
+        "toast_model_weekly": "{name} 周配额",
         "toast_title": "Claude {window} 已达 {pct}%",
         "toast_body_default": "提醒——你可能需要放慢节奏或切换项目。",
         "toast_body_90": "正在逼近上限，请合理安排。",
@@ -211,7 +213,7 @@ TOTAL_7D_MIN = 7 * 24 * 60
 # The quota snapshot is considered STALE once it's older than this. A healthy
 # pipeline refreshes every API_INTERVAL_SEC (360s); 900s = ~2.5 missed polls, so
 # a single failed-then-retried poll never trips it, but a genuinely stalled
-# pipeline (expired token waiting for Claude Code, dead network) shows up clearly.
+# pipeline (auth refresh blocked, dead network) shows up clearly.
 # When stale, the strip greys the quota and appends a marker so a future stall
 # reads as "old data", never as a frozen/broken app.
 STALE_AFTER_SEC = 900
@@ -227,8 +229,7 @@ def usage_age_seconds(last_api_fetch: float) -> int:
 
 def is_usage_stale(s) -> bool:
     """True when the displayed quota is old enough to flag — either the data has
-    aged past STALE_AFTER_SEC, or the token is known-expired (we never refresh it
-    ourselves; see state._do_fetch_cycle)."""
+    aged past STALE_AFTER_SEC, or token refresh is currently blocked/failing."""
     if getattr(s, "token_expired", False):
         return True
     age = usage_age_seconds(s.last_api_fetch)
@@ -236,18 +237,21 @@ def is_usage_stale(s) -> bool:
 
 
 # ---- Visual constants (dark theme) ----
-BG = "#1e1f22"          # window background
-PANEL = "#2b2d31"       # subdued panel background
-FG = "#e3e5e8"          # primary text
-FG_DIM = "#8a8d92"      # secondary text
-ACCENT = "#7c5cff"      # purple (matches Claude branding)
-WARN = "#ffa657"        # orange
-DANGER = "#ff5e5e"      # red
+# Softer, less "industrial" palette: deep neutral background, gently raised
+# cards with NO hard 1px outlines (the borderless look), and a slightly
+# desaturated violet accent. Progress bars are rounded pills (see _draw_bar).
+BG = "#15161b"          # window background
+PANEL = "#1e2026"       # raised card background (elevation via tone, not borders)
+PANEL_2 = "#282a33"     # hover / pressed surface
+FG = "#edeef2"          # primary text
+FG_DIM = "#9a9dab"      # secondary text
+ACCENT = "#8b7cff"      # violet (matches Claude branding, softened)
+WARN = "#f0a860"        # orange
+DANGER = "#f7716f"      # red
 OK = "#3ddc97"          # green
-BORDER = "#3a3c41"      # 1px card border + progress-bar track
+BORDER = "#2b2d37"      # progress-bar track + DWM hairline window border
 
-WINDOW_W, WINDOW_H = 360, 520   # nominal; height packs to content (see FloatingWindow)
-WINDOW_MIN_H = 320
+WINDOW_W = 360          # fixed width; height follows content (FloatingWindow._fit_height)
 TRAY_ICON_SIZE = 64     # internal render size; Windows downsamples to taskbar size
 
 # Sentinel "transparent color" for the strip's window — any pixel matching this
@@ -507,6 +511,107 @@ _kernel32.GetLastError.restype = wintypes.DWORD
 # already exists (i.e. another instance of us is already running).
 _ERROR_ALREADY_EXISTS = 183
 
+# ---- Win11 DWM chrome for borderless windows ----
+# Our top-level windows are overrideredirect (no native title bar — we draw our
+# own). On Win11 the DWM can still round the corners and paint a hairline
+# border for such windows, which is what gives the "frameless card" look
+# instead of a hard rectangle.
+_DWMWA_WINDOW_CORNER_PREFERENCE = 33
+_DWMWCP_ROUND = 2
+_DWMWA_BORDER_COLOR = 34
+try:
+    _dwmapi = ctypes.windll.dwmapi
+    _dwmapi.DwmSetWindowAttribute.argtypes = [
+        wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+    _dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+except OSError:  # pre-Vista or exotic environments — degrade to square corners
+    _dwmapi = None
+
+
+def _colorref(hex_color: str) -> int:
+    """'#rrggbb' → Win32 COLORREF (0x00BBGGRR)."""
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    return (b << 16) | (g << 8) | r
+
+
+def apply_frameless_chrome(win: tk.Misc) -> None:
+    """Round the corners of a borderless window and give it a subtle DWM
+    hairline border. Win11-only attributes; silently a no-op elsewhere.
+    Must be called after the window is mapped (deiconify/update_idletasks) and
+    re-called after every hide/show cycle — Tk can recreate the OS window."""
+    if _dwmapi is None:
+        return
+    try:
+        win.update_idletasks()
+        hwnd = int(win.wm_frame(), 16)
+    except (ValueError, tk.TclError):
+        return
+    corner = ctypes.c_int(_DWMWCP_ROUND)
+    border = ctypes.c_int(_colorref(BORDER))
+    try:
+        _dwmapi.DwmSetWindowAttribute(
+            hwnd, _DWMWA_WINDOW_CORNER_PREFERENCE,
+            ctypes.byref(corner), ctypes.sizeof(corner))
+        _dwmapi.DwmSetWindowAttribute(
+            hwnd, _DWMWA_BORDER_COLOR,
+            ctypes.byref(border), ctypes.sizeof(border))
+    except OSError:
+        pass
+
+
+def bind_window_drag(win: tk.Misc, *handles: tk.Widget) -> None:
+    """Make `handles` act as the title-bar drag area for borderless `win`.
+
+    Bind only on the specific handle widgets, never on the toplevel itself —
+    a toplevel-level <Button-1> binding would fire for every child widget via
+    bindtags and turn the whole window (buttons included) into a drag surface.
+    """
+    anchor: dict[str, int] = {}
+
+    def press(e) -> None:
+        anchor["dx"] = e.x_root - win.winfo_x()
+        anchor["dy"] = e.y_root - win.winfo_y()
+
+    def motion(e) -> None:
+        if not anchor:
+            return
+        # Keep the window grabbable. Borderless windows have no taskbar button
+        # and no WM move command, so a drag past a screen edge would strand it
+        # for the rest of the session. The drag handles sit on the LEFT of our
+        # title bar, so keeping the left edge on-screen is what guarantees
+        # there is always something left to grab. Mirrors the strip's clamp.
+        x = e.x_root - anchor["dx"]
+        y = e.y_root - anchor["dy"]
+        x = max(0, min(x, win.winfo_screenwidth() - 80))
+        y = max(0, min(y, win.winfo_screenheight() - 40))
+        win.geometry(f"+{x}+{y}")
+
+    for h in handles:
+        h.bind("<Button-1>", press)
+        h.bind("<B1-Motion>", motion)
+
+
+# Segoe MDL2 Assets glyphs (ships with Win10/11) — proper native-looking
+# title-bar icons instead of emoji/ASCII stand-ins.
+GLYPH_CLOSE = ""      # ChromeClose
+GLYPH_PIN = ""        # Pin
+GLYPH_REFRESH = ""    # Refresh
+
+
+def titlebar_btn(parent: tk.Widget, glyph: str, command, *,
+                 hover_fg: str = FG, hover_bg: str = PANEL_2) -> tk.Label:
+    """A flat, hover-highlighting title-bar button (Label, not tk.Button — no
+    3D press animation). The current resting color lives in ._normal_fg so
+    toggle buttons (pin) can restyle themselves and hover restores correctly."""
+    btn = tk.Label(parent, text=glyph, bg=BG, fg=FG_DIM,
+                   font=("Segoe MDL2 Assets", 10), padx=11, pady=7,
+                   cursor="hand2")
+    btn._normal_fg = FG_DIM  # type: ignore[attr-defined]
+    btn.bind("<Button-1>", lambda _e: command())
+    btn.bind("<Enter>", lambda _e: btn.config(fg=hover_fg, bg=hover_bg))
+    btn.bind("<Leave>", lambda _e: btn.config(fg=btn._normal_fg, bg=BG))
+    return btn
+
 
 def get_taskbar_top_logical(fallback_screen_h: int) -> int:
     """Return the Y coordinate (in this process's coord system) of the top edge of
@@ -676,6 +781,8 @@ class FloatingWindow:
     """
 
     PROJ_ROWS_MAX = 6
+    # Max simultaneously-displayed model-scoped weekly buckets (Fable, …).
+    SCOPED_ROWS_MAX = 4
 
     def __init__(self, orch: Orchestrator, on_close: callable) -> None:
         self.orch = orch
@@ -683,21 +790,29 @@ class FloatingWindow:
         self.root = tk.Tk()
         self.root.title(t("win_title"))
         self.root.configure(bg=BG)
-        self.root.geometry(f"{WINDOW_W}x{WINDOW_H}+200+200")
+        # Borderless: no native title bar — we draw our own (draggable) header
+        # and let Win11 DWM round the corners (apply_frameless_chrome in show()).
+        self.root.overrideredirect(True)
+        # Position only; height packs to content (the width-anchor frame in
+        # _build pins the width to WINDOW_W).
+        self.root.geometry("+200+200")
         self.root.attributes("-topmost", True)     # always on top by default
-        # Let height pack to content; only constrain the minimum so the window
-        # can't collapse. Width is fixed.
-        self.root.minsize(WINDOW_W, WINDOW_MIN_H)
         self.root.resizable(False, False)
-        # Closing the X button just hides — quitting is via tray.
+        # Closing just hides — quitting is via tray. (No WM decorations exist,
+        # but keep the protocol handler for completeness/AltF4-like paths.)
         self.root.protocol("WM_DELETE_WINDOW", self.hide)
+        self.root.bind("<Escape>", lambda _e: self.hide())
         # Start hidden until the user explicitly shows from tray.
         self.root.withdraw()
 
         # Per-bar last-drawn cache: (value_pct_rounded, width) → skip identical
-        # redraws. Keyed by a bar id ("5h", "7d", "opus_7d", "sonnet_7d",
+        # redraws. Keyed by a bar id ("5h", "7d", "scoped0".."scoped3",
         # "proj0".."proj5").
         self._bar_cache: dict[str, tuple] = {}
+        # Last height pushed through geometry() — see _fit_height.
+        self._applied_h: int | None = None
+        # Count of currently-packed scoped rows; drives the repack in _render.
+        self._scoped_shown = -1
 
         self._build()
         # Periodically repaint with the latest snapshot from orchestrator.
@@ -706,60 +821,61 @@ class FloatingWindow:
     # ---- construction helpers ----
 
     def _card(self, pad: int) -> tk.Frame:
-        """A bordered PANEL card (1px BORDER outline via highlight*)."""
-        card = tk.Frame(self.root, bg=PANEL,
-                        highlightbackground=BORDER, highlightthickness=1, bd=0)
-        card.pack(fill="x", padx=pad, pady=4)
+        """A raised PANEL card — no outline; elevation comes from tone alone
+        (the borderless look)."""
+        card = tk.Frame(self.root, bg=PANEL, highlightthickness=0, bd=0)
+        card.pack(fill="x", padx=pad, pady=5)
         return card
 
-    def _hoverable(self, widget: tk.Widget, normal_fg: str, hover_fg: str) -> None:
-        """Bind <Enter>/<Leave> so a header button brightens on hover."""
-        widget.bind("<Enter>", lambda _e: widget.config(fg=hover_fg))
-        widget.bind("<Leave>", lambda _e: widget.config(fg=normal_fg))
-
     def _build(self) -> None:
-        pad = 14
+        pad = 16
 
-        # --- Header ---
+        # Width anchor: pins the auto-sized window to WINDOW_W while height
+        # stays free to pack to content (scoped-model rows come and go).
+        tk.Frame(self.root, bg=BG, width=WINDOW_W, height=1).pack()
+
+        # --- Custom title bar (the window is borderless) ---
         header = tk.Frame(self.root, bg=BG)
-        header.pack(fill="x", padx=pad, pady=(pad, 6))
-        tk.Label(header, text=t("win_title"), bg=BG, fg=FG,
-                 font=("Segoe UI Semibold", 13)).pack(side="left")
-        self.refresh_btn = tk.Button(
-            header, text="↻", bg=BG, fg=FG_DIM, bd=0, font=("Segoe UI", 11),
-            activebackground=BG, activeforeground=FG,
-            command=self._refresh_clicked, cursor="hand2",
-        )
-        self.refresh_btn.pack(side="right", padx=4)
-        self._hoverable(self.refresh_btn, FG_DIM, ACCENT)
-        self.topmost_var = tk.BooleanVar(value=True)
-        self.pin_btn = tk.Checkbutton(
-            header, text="📌", variable=self.topmost_var, bg=BG, fg=FG_DIM,
-            selectcolor=BG, activebackground=BG, activeforeground=FG,
-            bd=0, font=("Segoe UI", 10), command=self._toggle_topmost,
-            cursor="hand2",
-        )
-        self.pin_btn.pack(side="right", padx=2)
-        self._hoverable(self.pin_btn, FG_DIM, ACCENT)
+        header.pack(fill="x", padx=(pad, 6), pady=(8, 4))
+        self.title_dot = tk.Canvas(header, width=8, height=8, bg=BG,
+                                   highlightthickness=0, bd=0)
+        self.title_dot.create_oval(0, 0, 7, 7, fill=ACCENT, outline="")
+        self.title_dot.pack(side="left")
+        self.title_lbl = tk.Label(header, text=t("win_title"), bg=BG, fg=FG,
+                                  font=("Segoe UI Semibold", 12))
+        self.title_lbl.pack(side="left", padx=(8, 0))
+        close_btn = titlebar_btn(header, GLYPH_CLOSE, self.hide,
+                                 hover_fg="#ffffff", hover_bg="#b3404a")
+        close_btn.pack(side="right")
+        self.pin_on = True
+        self.pin_btn = titlebar_btn(header, GLYPH_PIN, self._toggle_topmost)
+        self.pin_btn._normal_fg = ACCENT      # pinned by default
+        self.pin_btn.config(fg=ACCENT)
+        self.pin_btn.pack(side="right")
+        self.refresh_btn = titlebar_btn(header, GLYPH_REFRESH,
+                                        self._refresh_clicked)
+        self.refresh_btn.pack(side="right")
+        # Dragging the header (not its buttons) moves the window.
+        bind_window_drag(self.root, header, self.title_lbl, self.title_dot)
 
-        # --- Quota card (5h + 7d) ---
+        # --- Quota card (5h + 7d + model-scoped weekly buckets) ---
         quota = self._card(pad)
         self.quota_widgets: dict[str, tuple] = {}
         for key, label_key in (("5h", "lbl_5h_window"), ("7d", "lbl_weekly")):
             row = tk.Frame(quota, bg=PANEL)
-            row.pack(fill="x", padx=10, pady=(8, 0))
+            row.pack(fill="x", padx=12, pady=(10, 0))
             lbl = tk.Label(row, text=t(label_key), bg=PANEL, fg=FG_DIM,
                            font=("Segoe UI", 9), anchor="w")
             lbl.pack(side="left")
             pct_lbl = tk.Label(row, text="—", bg=PANEL, fg=FG,
                                font=("Segoe UI Semibold", 16), anchor="e")
             pct_lbl.pack(side="right")
-            bar_canvas = tk.Canvas(quota, height=8, bg=PANEL,
+            bar_canvas = tk.Canvas(quota, height=6, bg=PANEL,
                                    highlightthickness=0, bd=0)
-            bar_canvas.pack(fill="x", padx=10, pady=(2, 0))
+            bar_canvas.pack(fill="x", padx=12, pady=(3, 0))
             caption = tk.Label(quota, text="", bg=PANEL, fg=FG_DIM,
                                font=("Segoe UI", 8), anchor="w")
-            caption.pack(fill="x", padx=10, pady=(1, 6))
+            caption.pack(fill="x", padx=12, pady=(2, 8))
             # The label is pre-created and updated in _render so a language
             # switch reflects on the next tick.
             self.quota_widgets[key] = {
@@ -767,31 +883,36 @@ class FloatingWindow:
                 "pct": pct_lbl, "bar": bar_canvas, "caption": caption,
             }
 
-        # 7d Opus/Sonnet sub-rows (slim mini-bars). Pre-created; shown only when
-        # the snapshot carries per-model percentages.
-        self.subrows: dict[str, dict] = {}
-        for sub_key, label_key in (("opus", "opus"), ("sonnet", "sonnet")):
-            sub = tk.Frame(quota, bg=PANEL)
-            slbl = tk.Label(sub, text=t(label_key), bg=PANEL, fg=FG_DIM,
-                            font=("Segoe UI", 8), width=6, anchor="w")
-            slbl.pack(side="left")
-            spct = tk.Label(sub, text="", bg=PANEL, fg=FG_DIM,
-                            font=("Segoe UI", 8), width=5, anchor="e")
-            spct.pack(side="right")
-            sbar = tk.Canvas(sub, height=4, bg=PANEL, highlightthickness=0, bd=0)
-            sbar.pack(side="left", fill="x", expand=True, padx=(6, 6))
-            self.subrows[sub_key] = {
-                "frame": sub, "label": slbl, "label_key": label_key,
-                "pct": spct, "bar": sbar,
-            }
-        # Spacer under the sub-rows so they don't crowd the card edge.
-        self._quota_bottom_pad = tk.Frame(quota, bg=PANEL, height=4)
+        # Model-scoped weekly rows (Fable, …) — pre-created, shown only when the
+        # snapshot carries scoped buckets. Slightly slimmer than the main rows;
+        # each has its own reset caption because scoped buckets can reset at a
+        # different time than the overall weekly window.
+        self.scoped_rows: list[dict] = []
+        for _ in range(self.SCOPED_ROWS_MAX):
+            frame = tk.Frame(quota, bg=PANEL)
+            row = tk.Frame(frame, bg=PANEL)
+            row.pack(fill="x", padx=12)
+            lbl = tk.Label(row, text="", bg=PANEL, fg=FG_DIM,
+                           font=("Segoe UI", 9), anchor="w")
+            lbl.pack(side="left")
+            pct_lbl = tk.Label(row, text="", bg=PANEL, fg=FG,
+                               font=("Segoe UI Semibold", 13), anchor="e")
+            pct_lbl.pack(side="right")
+            bar = tk.Canvas(frame, height=5, bg=PANEL, highlightthickness=0, bd=0)
+            bar.pack(fill="x", padx=12, pady=(3, 0))
+            caption = tk.Label(frame, text="", bg=PANEL, fg=FG_DIM,
+                               font=("Segoe UI", 8), anchor="w")
+            caption.pack(fill="x", padx=12, pady=(2, 8))
+            self.scoped_rows.append({
+                "frame": frame, "label": lbl, "pct": pct_lbl,
+                "bar": bar, "caption": caption,
+            })
 
         # --- Cost card ---
         cost = self._card(pad)
         self.cost_caption = tk.Label(cost, text=t("cost_caption"), bg=PANEL,
                                      fg=FG_DIM, font=("Segoe UI", 8), anchor="w")
-        self.cost_caption.pack(fill="x", padx=10, pady=(6, 2))
+        self.cost_caption.pack(fill="x", padx=12, pady=(8, 2))
         self.cost_labels: dict[str, tk.Label] = {}
         for key, label_key, emphasized in (
             ("session", "lbl_session", False),
@@ -799,7 +920,7 @@ class FloatingWindow:
             ("month", "lbl_this_month", False),
         ):
             row = tk.Frame(cost, bg=PANEL)
-            row.pack(fill="x", padx=10, pady=2)
+            row.pack(fill="x", padx=12, pady=2)
             name_font = ("Segoe UI Semibold", 11) if emphasized else ("Segoe UI", 10)
             name_fg = FG if emphasized else FG_DIM
             nm = tk.Label(row, text=t(label_key), bg=PANEL, fg=name_fg,
@@ -829,7 +950,7 @@ class FloatingWindow:
         for _ in range(self.PROJ_ROWS_MAX):
             container = tk.Frame(proj_card, bg=PANEL)
             row = tk.Frame(container, bg=PANEL)
-            row.pack(fill="x", padx=10, pady=(4, 0))
+            row.pack(fill="x", padx=12, pady=(4, 0))
             base_lbl = tk.Label(row, text="", bg=PANEL, fg=FG,
                                 font=("Segoe UI", 9), anchor="w")
             base_lbl.pack(side="left")
@@ -840,7 +961,7 @@ class FloatingWindow:
                                 font=("Segoe UI", 9), anchor="e")
             cost_lbl.pack(side="right")
             bar = tk.Canvas(container, height=2, bg=PANEL, highlightthickness=0, bd=0)
-            bar.pack(fill="x", padx=10, pady=(1, 3))
+            bar.pack(fill="x", padx=12, pady=(1, 3))
             self.proj_rows.append({
                 "container": container, "base": base_lbl,
                 "parent": parent_lbl, "cost": cost_lbl, "bar": bar,
@@ -855,13 +976,25 @@ class FloatingWindow:
         self.orch.refresh_now()
 
     def _toggle_topmost(self) -> None:
-        self.root.attributes("-topmost", bool(self.topmost_var.get()))
+        self.pin_on = not self.pin_on
+        self.root.attributes("-topmost", self.pin_on)
+        # Restyle the pin as a toggle: accent when pinned, dim when not.
+        self.pin_btn._normal_fg = ACCENT if self.pin_on else FG_DIM
+        self.pin_btn.config(fg=self.pin_btn._normal_fg)
 
     def show(self) -> None:
         # Refresh the title here (cheap, and the only moment it's visible) so a
         # language switch made while hidden is reflected when the window opens.
         self.root.title(t("win_title"))
+        self.title_lbl.config(text=t("win_title"))
+        # Re-assert borderless before mapping: some Tk builds re-decorate an
+        # overrideredirect window across a withdraw/deiconify cycle.
+        self.root.overrideredirect(True)
         self.root.deiconify()
+        # Content may have changed while hidden (ticks keep running); re-fit
+        # before the user sees the window rather than one tick later.
+        self._fit_height()
+        apply_frameless_chrome(self.root)
         self.root.lift()
         self.root.focus_force()
 
@@ -870,11 +1003,32 @@ class FloatingWindow:
         if self.on_close:
             self.on_close()
 
+    def _fit_height(self) -> None:
+        """Pin the window to WINDOW_W and let only the HEIGHT follow content.
+
+        Auto-sizing on both axes lets a long project path widen the window, so
+        its width would jump around as the project list changes. Setting an
+        explicit geometry turns tk's auto-sizing off; winfo_reqheight() still
+        reports what the content wants (every row is single-line, so it doesn't
+        depend on the forced width), which is what makes the scoped Fable-style
+        rows able to grow and shrink the window without touching its width.
+        """
+        # Flush pending layout first: a scoped row packed/forgotten moments ago
+        # has only queued its geometry request, so winfo_reqheight() would still
+        # report the PREVIOUS frame's height and the window would lag one tick
+        # behind a row appearing or disappearing.
+        self.root.update_idletasks()
+        req_h = self.root.winfo_reqheight()
+        if req_h != self._applied_h:
+            self._applied_h = req_h
+            self.root.geometry(f"{WINDOW_W}x{req_h}")
+
     def _tick(self) -> None:
         # Reschedule in `finally` so a render exception can never break the chain
         # (same hardening as the strip — see TaskbarStrip._tick).
         try:
             self._render(self.orch.snapshot())
+            self._fit_height()
         except Exception:
             logging.getLogger(__name__).exception("window render failed")
         finally:
@@ -885,19 +1039,33 @@ class FloatingWindow:
 
     def _draw_bar(self, bar_id: str, canvas: tk.Canvas, pct: float, color: str,
                   height: int) -> None:
-        """Draw a horizontal progress bar (track + fill), skipping the redraw
-        when neither the rounded percent nor the canvas width changed since the
-        last call for this bar_id. Avoids per-tick flicker on static values."""
-        w = canvas.winfo_width() or (WINDOW_W - 2 * 14 - 20)
+        """Draw a rounded pill progress bar (track + fill) via wide round-capped
+        lines, skipping the redraw when neither the rounded percent nor the
+        canvas width changed since the last call for this bar_id. Avoids
+        per-tick flicker on static values."""
+        # Tk reports width 1 — NOT 0 — for a widget that has never been laid
+        # out, so a truthiness test here would silently accept 1 and both draw
+        # a stub blob AND poison the cache with it until the width changes.
+        # Reachable on the first render (the root is withdrawn until show())
+        # and on the tick a scoped/project row is packed for the first time.
+        w = canvas.winfo_width()
+        if w <= 1:
+            w = WINDOW_W - 2 * 16 - 24     # card padx 16 + canvas padx 12
         key = (round(pct, 1), w, color)
         if self._bar_cache.get(bar_id) == key:
             return
         self._bar_cache[bar_id] = key
         canvas.delete("all")
-        canvas.create_rectangle(0, 0, w, height, fill=BORDER, outline="")
-        fill_w = int(w * min(max(pct, 0), 100) / 100)
+        # A line of width=height with round caps IS a pill; endpoints are inset
+        # by the cap radius so the caps stay inside the canvas.
+        r = height / 2
+        y = height / 2
+        canvas.create_line(r, y, w - r, y, fill=BORDER, width=height,
+                           capstyle="round")
+        fill_w = w * min(max(pct, 0), 100) / 100
         if fill_w > 0:
-            canvas.create_rectangle(0, 0, fill_w, height, fill=color, outline="")
+            canvas.create_line(r, y, max(r + 1, fill_w - r), y, fill=color,
+                               width=height, capstyle="round")
 
     def _render(self, s) -> None:
         u: UsageSnapshot | None = s.usage
@@ -918,7 +1086,7 @@ class FloatingWindow:
                 w["caption"].config(
                     text=(s.usage_error[:60] if s.usage_error else t("loading")),
                     fg=(DANGER if s.usage_error else FG_DIM))
-                self._draw_bar(key, w["bar"], 0, BORDER, 8)
+                self._draw_bar(key, w["bar"], 0, BORDER, 6)
                 continue
             pct = getters[0]()
             minutes = getters[1]()
@@ -941,27 +1109,45 @@ class FloatingWindow:
                 w["caption"].config(text=cap, fg=FG_DIM)
             else:
                 w["caption"].config(text=t("idle_full"), fg=FG_DIM)
-            self._draw_bar(key, w["bar"], pct, color if not stale else BORDER, 8)
+            self._draw_bar(key, w["bar"], pct, color if not stale else BORDER, 6)
 
-        # 7d Opus/Sonnet sub-rows — shown only when present.
-        sub_specs = (
-            ("opus", (u.seven_day_opus_pct if u else None)),
-            ("sonnet", (u.seven_day_sonnet_pct if u else None)),
-        )
-        for sub_key, sub_pct in sub_specs:
-            sr = self.subrows[sub_key]
-            sr["label"].config(text=t(sr["label_key"]))
-            if sub_pct is None:
-                if sr["frame"].winfo_ismapped():
-                    sr["frame"].pack_forget()
-                self._bar_cache.pop(f"{sub_key}_7d", None)
-                continue
-            if not sr["frame"].winfo_ismapped():
-                # Pack just before the bottom spacer so order stays stable.
-                sr["frame"].pack(fill="x", padx=10, pady=(0, 2))
-            color = color_for_pct(sub_pct)
-            sr["pct"].config(text=f"{sub_pct:.0f}%", fg=color)
-            self._draw_bar(f"{sub_key}_7d", sr["bar"], sub_pct, color, 4)
+        # Model-scoped weekly rows (Fable, …) — shown only when present.
+        scoped = u.scoped_limits if u is not None else ()
+        needed = min(len(scoped), len(self.scoped_rows))
+        # Re-pack the visible prefix in index order whenever the count changes —
+        # incremental pack/forget could leave rows visually out of order after a
+        # bucket disappears and later returns. Tracked in a variable, not
+        # winfo_ismapped(), which lags within a tick.
+        if self._scoped_shown != needed:
+            self._scoped_shown = needed
+            for i, sr in enumerate(self.scoped_rows):
+                sr["frame"].pack_forget()
+                self._bar_cache.pop(f"scoped{i}", None)
+            for sr in self.scoped_rows[:needed]:
+                sr["frame"].pack(fill="x")
+        for i, sr in enumerate(self.scoped_rows[:needed]):
+            sl = scoped[i]
+            sr["label"].config(text=t("lbl_model_weekly").format(name=sl.name))
+            color = FG_DIM if stale else color_for_pct(sl.pct)
+            sr["pct"].config(text=f"{sl.pct:.0f}%", fg=color)
+            if stale:
+                sr["caption"].config(text=t("stale_mark"), fg=WARN)
+            elif sl.active:
+                clock = fmt_reset_clock(sl.reset)
+                cap = (t("resets_at").format(
+                           time=clock, left=fmt_minutes(sl.minutes_to_reset))
+                       if clock else fmt_minutes(sl.minutes_to_reset))
+                sr["caption"].config(text=cap, fg=FG_DIM)
+            else:
+                # No resets_at. For the 5h/7d rows that reliably means "no live
+                # window", but a scoped bucket can report a real utilization
+                # with no reset time — printing "idle (full quota)" under a big
+                # red 90% would be a flat contradiction. Only claim idle when
+                # the number actually agrees.
+                sr["caption"].config(
+                    text=(t("idle_full") if sl.pct <= 0 else ""), fg=FG_DIM)
+            self._draw_bar(f"scoped{i}", sr["bar"], sl.pct,
+                           BORDER if stale else color, 5)
 
         # --- Cost rows ---
         # Refresh names for i18n.
@@ -995,18 +1181,23 @@ class FloatingWindow:
                 # Bar width proportional to the top project's cost.
                 frac = (agg.cost_usd / max_cost * 100) if max_cost > 0 else 0
                 self._draw_bar(f"proj{i}", pr["bar"], frac, ACCENT, 2)
-                if not pr["container"].winfo_ismapped():
-                    pr["container"].pack(fill="x")
-            elif pr["container"].winfo_ismapped():
+                # Unconditional: while the panel is withdrawn (its normal
+                # state) every child reports ismapped()==0 even though it is
+                # still pack-managed, so a mapped-state test would never drop
+                # a row that fell out of the top-N — it would keep showing the
+                # previous month's project until the first tick after the user
+                # opens the panel. Re-packing an already-managed slave keeps
+                # its position, so ordering is unaffected.
+                pr["container"].pack(fill="x")
+            else:
                 pr["container"].pack_forget()
                 self._bar_cache.pop(f"proj{i}", None)
 
         # --- Footer ---
         age = usage_age_seconds(s.last_api_fetch)
         if stale:
-            # Actionable: token-expired says exactly what to do (use Claude Code,
-            # which rotates the shared token we deliberately never refresh); other
-            # stale causes (network, 429) show a generic stale + age line.
+            # Actionable: auth-stale means automatic refresh could not currently
+            # produce live data; other stale causes (network, 429) show age only.
             if getattr(s, "token_expired", False):
                 self.footer.config(text=t("stale_token"), fg=WARN)
             else:
@@ -1519,13 +1710,17 @@ class TaskbarStrip:
         self.canvas.create_text(x, y, text=text, fill=fg, font=font, anchor="w")
         return font.measure(text)
 
-    def _append_quota_parts(self, parts: list, label_key: str, quota_pct: float,
+    def _append_quota_parts(self, parts: list, label: str, quota_pct: float,
                             mins_remaining: int, total_window_min: int,
                             active: bool = True, stale: bool = False) -> None:
         """Append the (text, color, font) pieces for one quota's display in the
-        currently selected display_mode. Caller is responsible for any leading
-        separator. Pieces are appended in reading order (caller packs left-to-right
-        OR right-to-left based on STRIP_SIDE).
+        currently selected display_mode. `label` is the already-resolved display
+        text, NOT an i18n key — model-scoped buckets pass a server-provided name
+        through here, and a name that happened to equal a dictionary key (say a
+        model called "today") would otherwise render as that key's translation.
+        Caller is responsible for any leading separator. Pieces are appended in
+        reading order (caller packs left-to-right OR right-to-left based on
+        STRIP_SIDE).
 
         When `active` is False (no live window — the endpoint reports 0% with no
         resets_at), render just the quota% regardless of display_mode and skip
@@ -1536,7 +1731,7 @@ class TaskbarStrip:
         would be computed from a stale resets_at and are meaningless. The caller
         appends a visible "stale" marker so the greying isn't ambiguous.
         """
-        parts.append((t(label_key) + " ", FG_DIM, self.font_dim))
+        parts.append((label + " ", FG_DIM, self.font_dim))
         quota_color = FG_DIM if stale else color_for_pct(quota_pct)
         if stale or not active or self.display_mode == 1:
             # Stale / inactive / compact mode 1: just the quota%
@@ -1577,13 +1772,20 @@ class TaskbarStrip:
         stale = u is not None and is_usage_stale(s)
         parts: list[tuple[str, str, tkfont.Font]] = []
         if u is not None:
-            self._append_quota_parts(parts, "5h", u.five_hour_pct,
+            self._append_quota_parts(parts, t("5h"), u.five_hour_pct,
                                      u.five_hour_minutes_to_reset, TOTAL_5H_MIN,
                                      active=u.five_hour_active, stale=stale)
             parts.append(("   ·   ", FG_DIM, self.font_dim))
-            self._append_quota_parts(parts, "7d", u.seven_day_pct,
+            self._append_quota_parts(parts, t("7d"), u.seven_day_pct,
                                      u.seven_day_minutes_to_reset, TOTAL_7D_MIN,
                                      active=u.seven_day_active, stale=stale)
+            # Model-scoped weekly buckets (Fable, …) — the server-provided name
+            # is the label verbatim. Capped so the strip stays glanceable.
+            for sl in u.scoped_limits[:3]:
+                parts.append(("   ·   ", FG_DIM, self.font_dim))
+                self._append_quota_parts(parts, sl.name, sl.pct,
+                                         sl.minutes_to_reset, TOTAL_7D_MIN,
+                                         active=sl.active, stale=stale)
         if rpt is not None:
             if u is not None:
                 parts.append(("   ·   ", FG_DIM, self.font_dim))
@@ -1700,11 +1902,22 @@ class SettingsWindow:
         self.win.withdraw()
         self.win.title(t("settings_title"))
         self.win.configure(bg=BG)
-        self.win.geometry("430x470")
-        self.win.minsize(430, 470)
+        # Borderless like the main window; +45px height for the custom title bar.
+        self.win.overrideredirect(True)
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        self.win.geometry(f"430x515+{(sw - 430) // 2}+{max(0, (sh - 515) // 2)}")
         self.win.resizable(False, False)
-        self.win.transient(root)            # tied to the main window, NOT topmost
+        # NOTE: no transient(root) — a transient + overrideredirect Toplevel
+        # fails to map on Windows (stays 1x1 and never becomes viewable).
+        # Losing transient also loses the owned-window z-order it used to
+        # provide, and the main window is topmost by default — a non-topmost
+        # Settings would render UNDER it with no way to raise it (no taskbar
+        # button either, since we're borderless). So put Settings in the
+        # topmost band itself; it's an explicitly-opened, Escape-closable
+        # dialog, so staying on top while open is the expected behavior.
+        self.win.attributes("-topmost", True)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
+        self.win.bind("<Escape>", lambda _e: self.close())
 
         # Tk variables backing the live controls. Recreated each rebuild so a
         # language switch (which rebuilds) starts from current persisted state.
@@ -1718,6 +1931,7 @@ class SettingsWindow:
 
         self.win.update_idletasks()
         self.win.deiconify()
+        apply_frameless_chrome(self.win)
         self.win.lift()
         self.win.focus_force()
 
@@ -1740,6 +1954,16 @@ class SettingsWindow:
     # ---- shell (tab bar + content host) — built once ----
 
     def _build_shell(self) -> None:
+        # Custom title bar (the window is borderless) — draggable, close-only.
+        tb = tk.Frame(self.win, bg=BG)
+        tb.pack(fill="x", side="top", padx=(16, 6), pady=(8, 4))
+        self.title_lbl = tk.Label(tb, text=t("settings_title"), bg=BG, fg=FG,
+                                  font=("Segoe UI Semibold", 12))
+        self.title_lbl.pack(side="left")
+        titlebar_btn(tb, GLYPH_CLOSE, self.close,
+                     hover_fg="#ffffff", hover_bg="#b3404a").pack(side="right")
+        bind_window_drag(self.win, tb, self.title_lbl)
+
         bar = tk.Frame(self.win, bg=BG)
         bar.pack(fill="x", side="top")
         for key in ("general", "strip", "about"):
@@ -1774,6 +1998,7 @@ class SettingsWindow:
                                ("about", "tab_about")):
             self.tab_buttons[key].config(text=t(label_key))
         self.win.title(t("settings_title"))
+        self.title_lbl.config(text=t("settings_title"))
 
         # Drop old content frames.
         for fr in self.content_frames.values():
@@ -1791,7 +2016,9 @@ class SettingsWindow:
         for k, fr in self.content_frames.items():
             if k == key:
                 fr.pack(fill="both", expand=True)
-            elif fr.winfo_ismapped():
+            else:
+                # Unconditional — winfo_ismapped() lags until the next idle
+                # pass, which could leave two tabs packed simultaneously.
                 fr.pack_forget()
         # Tab styling: active = ACCENT fg + PANEL bg + ACCENT underline.
         for k, btn in self.tab_buttons.items():
@@ -2134,10 +2361,15 @@ class TrayApp:
         self.icon.stop()
         self._stop_callback()
 
+    # Win32 NOTIFYICONDATA.szTip is a 128-WCHAR buffer including the NUL, so a
+    # longer tooltip is rejected and the tray silently keeps showing the last
+    # accepted one. Adding a line per model-scoped bucket made overrun reachable.
+    TOOLTIP_MAX = 127
+
     def update_icon(self, pct: float, tooltip: str) -> None:
         try:
             self.icon.icon = render_tray_icon(pct)
-            self.icon.title = tooltip
+            self.icon.title = tooltip[:self.TOOLTIP_MAX]
         except Exception:
             pass
 
@@ -2147,8 +2379,21 @@ class TrayApp:
 
 
 def notify(kind: str, pct: float) -> None:
-    """Pop a Windows toast notification for a threshold crossing."""
-    window_label = t("toast_5h_window") if kind.startswith("5h") else t("toast_weekly")
+    """Pop a Windows toast notification for a threshold crossing.
+
+    kind is "5h_<t>", "7d_<t>", or "scoped:<name>:<t>" for model-scoped weekly
+    buckets (see Orchestrator._check_thresholds).
+    """
+    if kind.startswith("scoped:"):
+        # Split from the RIGHT: the trailing threshold is a bare int and can
+        # never contain a colon, but the bucket name is server-controlled free
+        # text that might (e.g. "Claude: Fable").
+        name = kind[len("scoped:"):].rsplit(":", 1)[0]
+        window_label = t("toast_model_weekly").format(name=name)
+    elif kind.startswith("5h"):
+        window_label = t("toast_5h_window")
+    else:
+        window_label = t("toast_weekly")
     title = t("toast_title").format(window=window_label, pct=f"{pct:.0f}")
     body = t("toast_body_default")
     if pct >= 95:
@@ -2259,6 +2504,10 @@ def main() -> int:
                 f"5h: {pct:.0f}%  resets {fmt_minutes(s.usage.five_hour_minutes_to_reset)}\n"
                 f"7d: {s.usage.seven_day_pct:.0f}%  resets {fmt_minutes(s.usage.seven_day_minutes_to_reset)}"
             )
+            # Bounded so truncation (see TrayApp.TOOLTIP_MAX) drops whole
+            # buckets rather than cutting a line mid-number.
+            for sl in s.usage.scoped_limits[:FloatingWindow.SCOPED_ROWS_MAX]:
+                tooltip += f"\n{sl.name[:24]}: {sl.pct:.0f}%"
             tray.update_icon(pct, tooltip)
 
     orch._on_change = on_change

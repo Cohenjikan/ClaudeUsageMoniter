@@ -35,7 +35,7 @@
 
 **ClaudeUsageMonitor 把权威数字钉在你的任务栏上，又绝不碍事。** 它读取 Claude Code 已经写到磁盘上的同一份 OAuth 令牌，调用 Anthropic 官方的用量接口，准确告诉你离上限还有多远——在你触顶之前。
 
-> **诀窍所在：** 它只**读取** Claude Code 位于 `~/.claude/.credentials.json` 的本地 OAuth 令牌，从不写入。本应用**没有任何登录界面**——装好即用。
+> **诀窍所在：** 它复用 Claude Code 位于 `~/.claude/.credentials.json` 的本地 OAuth 状态，并在 access token 过期时安全刷新写回。本应用**没有任何登录界面**——装好即用。
 
 ---
 
@@ -51,9 +51,9 @@
 5 小时与每周百分比就是 *Claude Code 所使用的同一份权威数字*，并且涵盖你**全部**订阅用量——Code **加上** chat/desktop/web——而不是从本地日志猜出来的。
 > `fetch_usage`（`usage_api.py:189`）向 `https://api.anthropic.com/api/oauth/usage` 发起 GET 请求，直接从响应中读取 `five_hour.utilization` / `seven_day.utilization`。该接口未公开文档；`User-Agent` 必须是 `claude-code/2.0.0`，否则会被归入更严格的限流桶。
 
-### 只读鉴权——绝不会搞挂你的 Claude Code 登录
-本监控器**从不刷新、从不写入**那份 OAuth 令牌。`~/.claude/.credentials.json` 里的 `refresh_token` 是和 Claude Code 共用的，而且**每次使用都会轮换**；任何进程去刷新它，都会让另一方手里的副本失效——曾经就因为在这里刷新过一次，把用户的 Claude Code 登录搞挂了。所以我们不刷。我们只读取 Claude Code 当前维护的那份 access token；一旦过期，就**等 Claude Code 自己去轮换**（它下次使用时就会刷新），随后自动拾取新令牌——这期间配额会被清楚地标记为**「数据旧」**，而不是当作实时数据展示。
-> `_do_fetch_cycle`（`state.py`）全程只调用 `load_oauth_creds`（读磁盘）+ `fetch_usage`（一次 GET）。令牌过期或返回 401 时，它置位 `token_expired`，并每隔 `TOKEN_RECHECK_SEC`（45 秒，不走网络）重读磁盘，因此你下次一用 Claude Code，它几秒内就恢复。全应用没有任何一处会写 `credentials.json`。
+### 自动续期鉴权——不再每 8 小时唤醒终端
+`~/.claude/.credentials.json` 里的 `refresh_token` 与 Claude Code 共用，并且每次刷新都会轮换，因此本应用会谨慎处理：先读取当前磁盘状态，只在 access token 过期或被服务端拒绝时刷新，并把新的 access/refresh token 原子写回同一个文件。
+> `_do_fetch_cycle`（`state.py`）在需要时调用 `refresh_and_save`，401 后只重试一次，并在 `invalid_grant` 或限流时退避。`save_oauth_creds`（`usage_api.py`）写入前会确认磁盘上的 `refreshToken` 仍是本次使用的那一个，因此不会覆盖 Claude Code 刚刚写入的新登录/刷新状态。
 
 ### 始终可见的任务栏条
 一条极小的无边框读数条直接停靠在 Windows 任务栏上，无需打开任何窗口即可一瞥配额。
@@ -82,12 +82,17 @@
 在你撞上上限之前，Windows 会弹出通知，措辞随着你逼近上限而逐级升级。
 > `Orchestrator.THRESHOLDS = (75, 90, 95)`（`state.py:76`）；`_check_thresholds` 在每次越过阈值时触发一次，并在用量回落后重新就绪；`notify()` 发送 `winotify` 通知，其正文在 90% 与 95% 时逐级升级。
 
+### 分模型周配额（Fable 等）
+Anthropic 现在会对部分模型在总周配额之外单独计量。每个这类配额都有自己的一行、进度条与重置倒计时——总周配额看着还宽裕时，模型专属的上限也不会悄悄逼近而你毫无察觉。
+
+> 用量接口把它们放在 `limits` 数组里，形如 `kind: "weekly_scoped"`，带有 `scope.model.display_name`（例如 `Fable`）、`percent`、`severity` 以及各自的 `resets_at`。`_parse_scoped_limits`（`usage_api.py`）**通用解析**——将来新增模型配额无需改代码即可显示——按名称去重，并在响应仍携带旧字段时兼容折叠 `seven_day_opus` / `seven_day_sonnet`。阈值告警按配额分别触发。
+
 ### 完整详情悬浮窗
-点击任务栏条或托盘图标，即可打开一张深色卡片，内含配额进度条、重置倒计时、花费汇总以及高消耗项目列表。
+点击任务栏条或托盘图标，即可打开一张深色无边框卡片，内含配额进度条、重置倒计时、花费汇总以及高消耗项目列表。
 
 ![深色悬浮详情窗口：分色显示的 5 小时与 7 天配额进度条、实时重置倒计时、会话／今日／本月花费，以及高消耗项目列表（演示数据）](screenshots/window.png)
 
-> `FloatingWindow` 渲染分色的 5h/7d 进度条（在有数据时还有 Opus/Sonnet 分模型子条）、绝对重置时刻配实时倒计时（每 1 秒重绘）、会话／今日／本月花费，以及最多 6 行高消耗项目。项目面板**仅统计当月**（`by_project_month`）。默认隐藏。
+> `FloatingWindow` 渲染分色的 5h/7d 胶囊进度条，以及每个分模型周配额各占一行、绝对重置时刻配实时倒计时（每 1 秒重绘）、会话／今日／本月花费，以及最多 6 行高消耗项目。项目面板**仅统计当月**（`by_project_month`）。窗口为无边框（`overrideredirect`），配自绘可拖动标题栏与 Win11 DWM 圆角；宽度锁定，高度随内容自适应。默认隐藏。
 
 ### 托盘图标实时显示 5h%
 即便没有打开任何窗口，系统托盘徽标也能让你一眼看到 5 小时用量，并按严重程度分色。
@@ -159,9 +164,9 @@ User-Agent: claude-code/2.0.0     # 必需——缺少它将被打入严格的�
 
 ```mermaid
 flowchart LR
-    A[Claude Code<br/>writes + rotates token] -->|~/.claude/.credentials.json| B[usage_api.py<br/>load_oauth_creds · read-only]
+    A[Claude Code<br/>writes + rotates token] -->|~/.claude/.credentials.json| B[usage_api.py<br/>load_oauth_creds · refresh_and_save]
     B -->|Bearer token<br/>UA: claude-code/2.0.0| C[/api/oauth/usage<br/>poll 6 min/]
-    B -.->|expired? wait for CC,<br/>never refresh| B
+    B -.->|expired/401?<br/>refresh + atomic save| B
     C --> D[state.py<br/>Orchestrator]
     E[~/.claude/projects/**.jsonl] -->|parse 30 s| F[jsonl_costs.py<br/>build_report]
     F --> D
@@ -196,7 +201,7 @@ flowchart LR
 - **独占全屏的游戏／应用会渲染在用户空间一切之上**，因此当某个这样的程序在前台时任务栏条会被遮住。请改用无边框窗口模式以保持其可见。
 - **仅限 Windows 10/11。** 尽管凭据路径在 macOS/Linux 上同样存在，整套 UI 都是 Windows 专属的（ctypes/user32、任务栏钉附、`winotify` 通知，以及一处用于通知投递的 PowerShell 路径修复）。它**不是**跨平台的。
 - **需要已有的 Claude Code 登录。** 本应用自身没有任何登录功能；它依赖 `~/.claude/.credentials.json` 事先就在那里。
-- **令牌过期时，配额只会「变旧」，绝不会变错。** 因为本应用从不刷新那份共用令牌（刷新可能搞挂你的 Claude Code 登录），access token 只在 **Claude Code 自己使用时**才续期。如果你 ~8 小时没碰 Claude Code（比如过夜），令牌就会过期、配额随之冻结——但它会被清楚地**置灰并标上「数据旧」及其时长**，你下次一用 Claude Code，约 45 秒内就恢复实时。数据旧 ≠ 程序卡死。
+- **刷新失败时，配额只会「变旧」，绝不会变错。** 本应用现在会自己刷新共用 OAuth 令牌，因此正常的 ~8 小时 access-token 过期不再需要终端里的 Claude Code 会话来唤醒。如果刷新被拒绝、被限流或网络不可用，配额会被清楚地**置灰并标上「数据旧」及其时长**，直到下一次成功拉取。
 - **它依赖一个未公开文档的接口和一个伪造的 User-Agent。** 这并非 Anthropic 官方或受支持的集成——Anthropic 随时可能更改 `/api/oauth/usage` 接口或对 `claude-code/2.0.0` UA 的预期，从而让配额读数失效。
 
 ---
@@ -204,10 +209,10 @@ flowchart LR
 ## 架构
 
 ```
-usage_api.py     OAuth 令牌加载器（只读）+ /api/oauth/usage HTTP 客户端。
+usage_api.py     OAuth 令牌加载/刷新器 + /api/oauth/usage HTTP 客户端。
 jsonl_costs.py   JSONL 解析器 + 花费聚合器（内联的两档缓存定价表）。
 state.py         两个守护线程：API 轮询（6 分钟）与 JSONL 解析（30 秒）。
-                 只读鉴权：从不刷新共用令牌，过期时把数据标记为旧；
+                 自动刷新过期/被拒绝的 OAuth 令牌；鉴权或限流失败时退避。
                  阈值越线告警每个窗口每次越线触发一次。
 app.py           入口点：tkinter FloatingWindow + pystray 托盘图标 + TaskbarStrip。
                  任务栏条采用三重置顶防御，稳压 Win11 外壳之上。
@@ -220,7 +225,7 @@ app.py           入口点：tkinter FloatingWindow + pystray 托盘图标 + Tas
 大多数行为是 `app.py` 顶部的常量：
 
 ```python
-WINDOW_W, WINDOW_H = 340, 460     # 悬浮窗口尺寸
+WINDOW_W = 360                    # 悬浮窗口宽度（高度随内容自适应）
 STRIP_W, STRIP_H = 360, 26        # 任务栏条标称尺寸（宽度会自动伸缩以容纳文字）
 STRIP_SIDE = "left"               # "left" 或 "right"——靠哪一侧屏幕边缘
 STRIP_SIDE_MARGIN = 12            # 与所选边缘的间距

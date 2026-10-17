@@ -8,7 +8,7 @@ import json
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -16,12 +16,19 @@ from typing import Any
 # and by tools like CodeZeno's Claude-Code-Usage-Monitor and Maciek-roboblog's monitor).
 USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
 
-# OAuth token refresh endpoint + Claude Code's OAuth client_id (matches what
-# `claude /login` uses). Refresh tokens rotate on every use, so any caller of
-# `refresh_oauth` MUST persist the returned refresh_token immediately —
+# OAuth token refresh endpoint + Claude Code's OAuth client_id (matches Claude
+# Code 2.1.x's bundled OAuth config). Refresh tokens rotate on every use, so any
+# caller of `refresh_oauth` MUST persist the returned refresh_token immediately —
 # otherwise the next refresh will hit invalid_grant and force a re-login.
-OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CLAUDE_CODE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+DEFAULT_CLAUDE_AI_SCOPES = (
+    "user:profile",
+    "user:inference",
+    "user:sessions:claude_code",
+    "user:mcp_servers",
+    "user:file_upload",
+)
 
 # User-Agent must look like Claude Code or the endpoint hits a much tighter rate-limit bucket.
 # See: github.com/anthropics/claude-code/issues/31021
@@ -29,6 +36,35 @@ DEFAULT_UA = "claude-code/2.0.0"
 
 # Path to Claude Code's local OAuth credentials (Windows / macOS / Linux all use ~/.claude).
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
+
+
+class CredentialsChangedError(RuntimeError):
+    """Raised when credentials changed on disk during a refresh cycle."""
+
+
+@dataclass
+class ScopedLimit:
+    """A model-scoped (or surface-scoped) weekly quota bucket.
+
+    Mid-2026 the usage endpoint grew a generic `limits` array; model-specific
+    weekly quotas (e.g. the separate Fable bucket) arrive as kind
+    "weekly_scoped" entries there, replacing the old fixed seven_day_opus /
+    seven_day_sonnet top-level fields (now null). We parse them generically so
+    new model buckets appear without code changes.
+    """
+
+    name: str                     # server display name, e.g. "Fable"
+    pct: float                    # 0–100 utilization
+    reset: str                    # ISO 8601 resets_at, "" if absent
+    severity: str = "normal"      # server-reported: normal / warning / critical
+
+    @property
+    def minutes_to_reset(self) -> int:
+        return _minutes_until_iso(self.reset)
+
+    @property
+    def active(self) -> bool:
+        return bool(self.reset)
 
 
 @dataclass
@@ -44,6 +80,7 @@ class UsageSnapshot:
     extra_usage_enabled: bool
     fetched_at: float             # Unix timestamp when this snapshot was taken
     raw: dict[str, Any]           # Full response body for debugging / future fields
+    scoped_limits: tuple[ScopedLimit, ...] = ()  # model-scoped weekly buckets (Fable, …)
 
     @property
     def five_hour_minutes_to_reset(self) -> int:
@@ -86,6 +123,7 @@ class OAuthCreds:
     access_token: str
     refresh_token: str
     expires_at_unix: float    # Unix seconds (not ms)
+    scopes: tuple[str, ...] = ()
 
     def is_expired(self, buffer_sec: float = 30) -> bool:
         """True if the access token is past expiry, including a small safety buffer
@@ -122,10 +160,12 @@ def load_oauth_creds(creds_path: Path = CREDENTIALS_PATH) -> OAuthCreds:
         access_token=access,
         refresh_token=oauth.get("refreshToken") or "",
         expires_at_unix=(oauth.get("expiresAt") or 0) / 1000,
+        scopes=tuple(oauth.get("scopes") or ()),
     )
 
 
-def refresh_oauth(refresh_token: str, *, user_agent: str = DEFAULT_UA) -> dict[str, Any]:
+def refresh_oauth(refresh_token: str, *, scopes: tuple[str, ...] = (),
+                  user_agent: str = DEFAULT_UA) -> dict[str, Any]:
     """POST the refresh_token to Anthropic's OAuth endpoint and return the raw
     response dict — keys include `access_token`, `refresh_token`, `expires_in`,
     `scope`, `token_uuid`, etc.
@@ -142,6 +182,7 @@ def refresh_oauth(refresh_token: str, *, user_agent: str = DEFAULT_UA) -> dict[s
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
         "client_id": CLAUDE_CODE_CLIENT_ID,
+        "scope": " ".join(scopes or DEFAULT_CLAUDE_AI_SCOPES),
     }).encode("utf-8")
     req = urllib.request.Request(
         OAUTH_TOKEN_URL, data=body, method="POST",
@@ -156,7 +197,8 @@ def refresh_oauth(refresh_token: str, *, user_agent: str = DEFAULT_UA) -> dict[s
 
 
 def save_oauth_creds(new_access: str, new_refresh: str, expires_in_sec: int,
-                     creds_path: Path = CREDENTIALS_PATH) -> None:
+                     creds_path: Path = CREDENTIALS_PATH,
+                     expected_refresh_token: str | None = None) -> None:
     """Atomically write new OAuth tokens back to credentials.json, preserving
     every other field (organization id, account info, scopes — anything Claude
     Code put there besides accessToken/refreshToken/expiresAt).
@@ -171,6 +213,13 @@ def save_oauth_creds(new_access: str, new_refresh: str, expires_in_sec: int,
     else:
         creds = {}
     oauth = creds.setdefault("claudeAiOauth", {})
+    if (
+        expected_refresh_token is not None
+        and oauth.get("refreshToken") != expected_refresh_token
+    ):
+        raise CredentialsChangedError(
+            "Claude Code credentials changed while refresh was in flight"
+        )
     oauth["accessToken"] = new_access
     oauth["refreshToken"] = new_refresh
     oauth["expiresAt"] = int((time.time() + expires_in_sec) * 1000)
@@ -189,14 +238,99 @@ def refresh_and_save(creds_path: Path = CREDENTIALS_PATH) -> OAuthCreds:
     current = load_oauth_creds(creds_path)
     if not current.refresh_token:
         raise ValueError("No refresh_token available; please /login in Claude Code")
-    resp = refresh_oauth(current.refresh_token)
-    save_oauth_creds(
-        new_access=resp["access_token"],
-        new_refresh=resp["refresh_token"],
-        expires_in_sec=int(resp.get("expires_in", 28800)),
-        creds_path=creds_path,
-    )
+    resp = refresh_oauth(current.refresh_token, scopes=current.scopes)
+    try:
+        save_oauth_creds(
+            new_access=resp["access_token"],
+            new_refresh=resp["refresh_token"],
+            expires_in_sec=int(resp.get("expires_in", 28800)),
+            creds_path=creds_path,
+            expected_refresh_token=current.refresh_token,
+        )
+    except CredentialsChangedError:
+        # Another process refreshed/logged in and wrote a newer credentials file
+        # before our save. Do not overwrite it; use the fresh on-disk state.
+        return load_oauth_creds(creds_path)
     return load_oauth_creds(creds_path)
+
+
+def _parse_scoped_limits(body: dict[str, Any]) -> tuple[ScopedLimit, ...]:
+    """Extract model-scoped weekly buckets from the `limits` array, folding in
+    the legacy seven_day_opus / seven_day_sonnet fields when they still carry
+    data and no equivalent scoped entry exists (transition-period responses).
+
+    Every field is type-normalized rather than merely None-checked: this parses
+    an undocumented endpoint whose shape we expect to keep drifting, and an
+    AttributeError here would abort snapshot_from_body entirely — throwing away
+    the perfectly valid five_hour / seven_day data in the same response.
+
+    Names are deduped (highest pct wins) because the scope object has both a
+    `model` and a `surface` dimension: two entries for one model on different
+    surfaces both resolve to that model's name, and downstream alert state is
+    keyed by name — a duplicate would let the lower-pct entry clear threshold
+    marks the higher-pct one just set, re-firing toasts on every poll.
+    """
+    scoped: list[ScopedLimit] = []
+    for lim in body.get("limits") or ():
+        if not isinstance(lim, dict) or lim.get("kind") != "weekly_scoped":
+            continue
+        scope = lim.get("scope")
+        scope = scope if isinstance(scope, dict) else {}
+        model = scope.get("model")
+        if isinstance(model, str):
+            model = {"id": model}      # bare model id — keep it as the name
+        elif not isinstance(model, dict):
+            model = {}
+        surface = scope.get("surface")
+        if isinstance(surface, dict):
+            surface = surface.get("display_name") or surface.get("id")
+        elif not isinstance(surface, str):
+            surface = None
+        name = model.get("display_name") or model.get("id") or surface
+        if not name or not isinstance(name, str):
+            continue
+        try:
+            pct = float(lim.get("percent") or 0)
+        except (TypeError, ValueError):
+            pct = 0.0
+        reset = lim.get("resets_at")
+        scoped.append(ScopedLimit(
+            name=name,
+            pct=pct,
+            reset=reset if isinstance(reset, str) else "",
+            severity=str(lim.get("severity") or "normal"),
+        ))
+    for legacy_key, legacy_name in (("seven_day_opus", "Opus"),
+                                    ("seven_day_sonnet", "Sonnet")):
+        obj = body.get(legacy_key)
+        if not isinstance(obj, dict) or obj.get("utilization") is None:
+            continue
+        if any(s.name.lower() == legacy_name.lower() for s in scoped):
+            continue
+        try:
+            legacy_pct = float(obj["utilization"])
+        except (TypeError, ValueError):
+            continue
+        reset = obj.get("resets_at")
+        scoped.append(ScopedLimit(
+            name=legacy_name,
+            pct=legacy_pct,
+            reset=reset if isinstance(reset, str) else "",
+        ))
+    # Collapse same-name entries, keeping the highest utilization. Order of
+    # first appearance is preserved so the UI row order stays stable.
+    deduped: dict[str, ScopedLimit] = {}
+    for sl in scoped:
+        prev = deduped.get(sl.name)
+        if prev is None:
+            deduped[sl.name] = sl
+        elif sl.pct > prev.pct:
+            # Don't let the winner's blank resets_at discard a reset time the
+            # loser did carry — the UI needs one to show a countdown.
+            deduped[sl.name] = replace(sl, reset=sl.reset or prev.reset)
+        elif not prev.reset and sl.reset:
+            deduped[sl.name] = replace(prev, reset=sl.reset)
+    return tuple(deduped.values())
 
 
 def snapshot_from_body(body: dict[str, Any], fetched_at: float) -> UsageSnapshot:
@@ -205,23 +339,43 @@ def snapshot_from_body(body: dict[str, Any], fetched_at: float) -> UsageSnapshot
     Single parsing path shared by the live fetch and the on-disk last-snapshot
     cache, so a snapshot reconstructed from `usage_cache.json` is byte-for-byte
     equivalent to one parsed fresh from the network.
+
+    Every section is type-checked, not just None-checked: a wrong-typed field
+    from this undocumented endpoint must degrade that one value, never raise
+    and throw away the rest of an otherwise valid response.
     """
-    five = body.get("five_hour") or {}
-    seven = body.get("seven_day") or {}
-    seven_opus = body.get("seven_day_opus") or {}
-    seven_sonnet = body.get("seven_day_sonnet") or {}
-    extra = body.get("extra_usage") or {}
+    def section(key: str) -> dict[str, Any]:
+        val = body.get(key)
+        return val if isinstance(val, dict) else {}
+
+    def pct(obj: dict[str, Any], key: str = "utilization") -> float | None:
+        val = obj.get(key)
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
+    def iso(obj: dict[str, Any]) -> str:
+        val = obj.get("resets_at")
+        return val if isinstance(val, str) else ""
+
+    five = section("five_hour")
+    seven = section("seven_day")
+    extra = section("extra_usage")
 
     return UsageSnapshot(
-        five_hour_pct=float(five.get("utilization", 0) or 0),
-        five_hour_reset=five.get("resets_at", "") or "",
-        seven_day_pct=float(seven.get("utilization", 0) or 0),
-        seven_day_reset=seven.get("resets_at", "") or "",
-        seven_day_opus_pct=(float(seven_opus["utilization"]) if seven_opus.get("utilization") is not None else None),
-        seven_day_sonnet_pct=(float(seven_sonnet["utilization"]) if seven_sonnet.get("utilization") is not None else None),
+        five_hour_pct=pct(five) or 0.0,
+        five_hour_reset=iso(five),
+        seven_day_pct=pct(seven) or 0.0,
+        seven_day_reset=iso(seven),
+        seven_day_opus_pct=pct(section("seven_day_opus")),
+        seven_day_sonnet_pct=pct(section("seven_day_sonnet")),
         extra_usage_enabled=bool(extra.get("is_enabled")),
         fetched_at=fetched_at,
         raw=body,
+        scoped_limits=_parse_scoped_limits(body),
     )
 
 
@@ -269,8 +423,6 @@ if __name__ == "__main__":
 
     print(f"  5h:  {snap.five_hour_pct:5.1f}%  resets in {snap.five_hour_minutes_to_reset} min")
     print(f"  7d:  {snap.seven_day_pct:5.1f}%  resets in {snap.seven_day_minutes_to_reset} min")
-    if snap.seven_day_sonnet_pct is not None:
-        print(f"  Son: {snap.seven_day_sonnet_pct:5.1f}%")
-    if snap.seven_day_opus_pct is not None:
-        print(f"  Opu: {snap.seven_day_opus_pct:5.1f}%")
+    for sl in snap.scoped_limits:
+        print(f"  {sl.name}: {sl.pct:5.1f}%  ({sl.severity})  resets in {sl.minutes_to_reset} min")
     print(f"  extra_usage enabled: {snap.extra_usage_enabled}")

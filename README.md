@@ -35,7 +35,7 @@ You live in Claude Code all day. You keep hitting the 5-hour wall or the weekly 
 
 **ClaudeUsageMonitor pins the authoritative numbers to your taskbar and stays out of your way.** It reads the same OAuth token Claude Code already wrote to disk, calls Anthropic's own usage endpoint, and shows you exactly how close you are to the limit — before you slam into it.
 
-> **The trick:** it *reads* Claude Code's local OAuth token at `~/.claude/.credentials.json` — and never writes it. There is **no login screen anywhere in this app** — install it and it just works.
+> **The trick:** it uses Claude Code's local OAuth state at `~/.claude/.credentials.json`, and safely refreshes it when the access token expires. There is **no login screen anywhere in this app** — install it and it just works.
 
 ---
 
@@ -51,9 +51,9 @@ Install and it just works, using the Claude Code session you already have. Nothi
 The 5-hour and weekly percentages are the *same authoritative numbers Claude Code uses*, and they include **all** of your subscription usage — Code **plus** chat/desktop/web — not a guess from local logs.
 > `fetch_usage` (`usage_api.py:189`) GETs `https://api.anthropic.com/api/oauth/usage` and reads `five_hour.utilization` / `seven_day.utilization` straight from the response. The endpoint is undocumented; the `User-Agent` must be `claude-code/2.0.0` or it lands in a tighter rate-limit bucket.
 
-### Read-only auth — it can never break your Claude Code login
-This monitor **never refreshes or writes** the OAuth token. The `refresh_token` in `~/.claude/.credentials.json` is shared with Claude Code and *rotates on every use*, so any process that refreshes it invalidates the other's copy — refreshing here once broke the user's Claude Code login. So we don't. We read whatever access token Claude Code currently maintains; when it expires, we **wait for Claude Code to rotate it** (which it does on its own next use) and pick up the fresh token automatically — meanwhile the quota is clearly marked **stale** rather than shown as live.
-> `_do_fetch_cycle` (`state.py`) only ever calls `load_oauth_creds` (a disk read) + `fetch_usage` (a GET). On an expired/401 token it sets `token_expired` and re-checks the disk every `TOKEN_RECHECK_SEC` (45 s, no network) so it recovers within seconds of your next Claude Code use. Nothing in the app writes `credentials.json`.
+### Self-refreshing auth — no terminal wake-up every 8 hours
+The `refresh_token` in `~/.claude/.credentials.json` is shared with Claude Code and rotates on every successful refresh, so this app treats it carefully: it reads the current disk state, refreshes only when the access token is expired or rejected, and atomically writes the new access/refresh pair back to the same file.
+> `_do_fetch_cycle` (`state.py`) calls `refresh_and_save` when needed, retries once after a 401, and backs off on `invalid_grant` or rate limits. `save_oauth_creds` (`usage_api.py`) verifies the on-disk `refreshToken` is still the one it used before writing, so a newer Claude Code login/refresh is not overwritten.
 
 ### Always-visible taskbar strip
 A tiny borderless readout sits right on the Windows taskbar, so your quota is glanceable without opening anything.
@@ -83,12 +83,16 @@ Cost estimates respect Anthropic's split cache-creation pricing, so the equivale
 Windows pops a notification before you hit the wall, with escalating wording as you approach the limit.
 > `Orchestrator.THRESHOLDS = (75, 90, 95)` (`state.py:76`); `_check_thresholds` fires once per crossing and re-arms when usage drops below; `notify()` sends a `winotify` toast whose body escalates at 90% and 95%.
 
+### Per-model weekly quotas (Fable and friends)
+Anthropic now meters some models against their own weekly bucket on top of the overall weekly limit. Each one gets its own row, bar, and reset countdown — so a model-specific limit can't sneak up on you while the overall weekly number still looks healthy.
+> The usage endpoint returns these as `kind: "weekly_scoped"` entries in a `limits` array, carrying `scope.model.display_name` (e.g. `Fable`), `percent`, `severity`, and their own `resets_at`. `_parse_scoped_limits` (`usage_api.py`) reads them **generically** — a new model bucket shows up with no code change — deduping by name and folding in the legacy `seven_day_opus` / `seven_day_sonnet` fields when a response still carries them. Threshold alerts fire per bucket.
+
 ### Full-detail floating window
-Click the strip or tray for a dark card with quota bars, reset countdowns, cost rollups, and a top-projects list.
+Click the strip or tray for a dark, borderless card with quota bars, reset countdowns, cost rollups, and a top-projects list.
 
 ![The dark floating detail window: color-coded 5h and 7-day quota bars, live reset countdowns, session/today/month cost, and a top-projects list (demo data)](screenshots/window.png)
 
-> `FloatingWindow` renders color-coded 5h/7d bars (with per-model Opus/Sonnet sub-bars when present), absolute reset times with live countdowns (repaints every 1 s), session/today/month costs, and up to 6 top-project rows. The projects panel is **scoped to the current month** (`by_project_month`). Hidden by default.
+> `FloatingWindow` renders color-coded 5h/7d pill bars plus one row per model-scoped weekly bucket, absolute reset times with live countdowns (repaints every 1 s), session/today/month costs, and up to 6 top-project rows. The projects panel is **scoped to the current month** (`by_project_month`). The window is borderless (`overrideredirect`) with a custom draggable title bar and Win11 DWM rounded corners; its width is pinned while the height follows content. Hidden by default.
 
 ### Tray icon shows live 5h%
 Even with no windows open, the system-tray badge tells you your 5-hour usage at a glance, color-coded by severity.
@@ -160,9 +164,9 @@ The endpoint is rate-limited at ~5 requests/token, so we poll it every **6 minut
 
 ```mermaid
 flowchart LR
-    A[Claude Code<br/>writes + rotates token] -->|~/.claude/.credentials.json| B[usage_api.py<br/>load_oauth_creds · read-only]
+    A[Claude Code<br/>writes + rotates token] -->|~/.claude/.credentials.json| B[usage_api.py<br/>load_oauth_creds · refresh_and_save]
     B -->|Bearer token<br/>UA: claude-code/2.0.0| C[/api/oauth/usage<br/>poll 6 min/]
-    B -.->|expired? wait for CC,<br/>never refresh| B
+    B -.->|expired/401?<br/>refresh + atomic save| B
     C --> D[state.py<br/>Orchestrator]
     E[~/.claude/projects/**.jsonl] -->|parse 30 s| F[jsonl_costs.py<br/>build_report]
     F --> D
@@ -197,7 +201,7 @@ Read these before you rely on the numbers. They are deliberate, not bugs.
 - **Exclusive-fullscreen games/apps render above everything in user space**, so the strip is hidden while one is in front. Use borderless-windowed mode to keep it visible.
 - **Windows 10/11 only.** Despite the credentials path existing on macOS/Linux, the entire UI is Windows-specific (ctypes/user32, taskbar pinning, `winotify` toasts, a PowerShell-path fix for toast delivery). It is **not** cross-platform.
 - **Requires an existing Claude Code login.** The app has no login of its own; it relies on `~/.claude/.credentials.json` already being there.
-- **Quota goes *stale*, never wrong, when the token expires.** Because the app never refreshes the shared token (doing so could break your Claude Code login), the access token only renews when **Claude Code itself** uses it. If you don't touch Claude Code for ~8 h (e.g. overnight), the token expires and the quota freezes — but it's clearly **greyed and marked stale with its age**, and snaps back to live within ~45 s the next time you use Claude Code. Stale ≠ frozen app.
+- **Quota goes *stale*, never wrong, if refresh cannot complete.** The app now refreshes the shared OAuth token itself, so it should survive the normal ~8 h access-token expiry without a terminal Claude Code session. If refresh is rejected, rate-limited, or offline, the quota is clearly **greyed and marked stale with its age** until a fresh fetch succeeds.
 - **It relies on an undocumented endpoint and a spoofed User-Agent.** This is not an official or supported Anthropic integration — Anthropic could change the `/api/oauth/usage` endpoint or the `claude-code/2.0.0` UA expectation at any time and break the quota readout.
 
 ---
@@ -205,11 +209,11 @@ Read these before you rely on the numbers. They are deliberate, not bugs.
 ## Architecture
 
 ```
-usage_api.py     OAuth token loader (READ-ONLY) + /api/oauth/usage HTTP client.
+usage_api.py     OAuth token loader/refresher + /api/oauth/usage HTTP client.
 jsonl_costs.py   JSONL parser + cost aggregator (two-tier cache pricing table inline).
 state.py         Two daemon threads: API poll (6 min) and JSONL parse (30 s).
-                 Read-only auth: never refreshes the shared token; marks data
-                 stale when it expires. Threshold alerts fire once per crossing.
+                 Self-refreshes expired/rejected OAuth tokens, backs off on auth
+                 or rate-limit errors. Threshold alerts fire once per crossing.
 app.py           Entry point: tkinter FloatingWindow + pystray tray icon + TaskbarStrip.
                  Strip uses a 3-mechanism topmost defense to stay on top of the Win11 shell.
 ```
@@ -221,7 +225,7 @@ app.py           Entry point: tkinter FloatingWindow + pystray tray icon + Taskb
 Most behavior is constants at the top of `app.py`:
 
 ```python
-WINDOW_W, WINDOW_H = 340, 460     # floating window size
+WINDOW_W = 360                    # floating window width (height follows content)
 STRIP_W, STRIP_H = 360, 26        # taskbar strip nominal size (width auto-grows to fit text)
 STRIP_SIDE = "left"               # "left" or "right" — which screen edge
 STRIP_SIDE_MARGIN = 12            # gap from chosen edge
