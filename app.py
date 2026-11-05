@@ -30,11 +30,13 @@ import pystray
 from PIL import Image, ImageDraw, ImageFont
 from winotify import Notification, audio
 
+import statusline
 from jsonl_costs import Aggregate
+from paths import FROZEN, app_dir
 from state import Orchestrator
 from usage_api import UsageSnapshot
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 # Project home page — shown/opened from the Settings → General tab.
 PROJECT_URL = "https://github.com/Cohenjikan/ClaudeUsageMoniter"
@@ -80,9 +82,11 @@ LANGUAGES: dict[str, dict[str, str]] = {
         # fragments live here so they translate.
         "resets_at": "resets at {time} · {left} left",  # {time}=HH:MM, {left}=2h 13m
         "updated_ago": "updated {age} ago",
+        "via_statusline": "via status line",
+        "via_api": "via API",
         # ---- Staleness / token-expired state ----
         "stale_mark": "stale",                            # short strip marker
-        "stale_token": "Sign-in refresh failed - open Claude Code if this persists",
+        "stale_token": "Sign-in expired — open Claude Code to refresh quota",
         "stale_generic": "Quota data stale · {age} old",
         # ---- Settings window ----
         "settings_title": "Settings",
@@ -105,11 +109,28 @@ LANGUAGES: dict[str, dict[str, str]] = {
         "strip_drag_on": "Drag mode: ON (drag the strip)",
         "strip_drag_off": "Drag mode: OFF",
         "strip_reset_pos": "Reset position",
+        "strip_embed": "Embed inside the taskbar (experimental)",
+        "strip_embed_hint": "Child window of the taskbar: can't be covered, no topmost polling. "
+                            "Turn off if it misbehaves on your Windows build.",
+        # ---- Quota source ----
+        "quota_source": "Quota source",
+        "src_statusline": "Claude Code status line (recommended)",
+        "src_statusline_hint": "Token-free and live. Adds a statusLine entry to "
+                               "~/.claude/settings.json (your existing one keeps working).",
+        "src_api": "Fallback: read-only usage API while Claude Code is idle",
+        "src_state_off": "Status line: not installed",
+        "src_state_waiting": "Status line: installed — waiting for a Claude Code session",
+        "src_state_live": "Status line: live · updated {age} ago",
+        "src_state_idle": "Status line: idle · last update {age} ago",
+        "src_install_failed": "Could not update ~/.claude/settings.json — see log",
         "about_blurb": (
-            "5h / 7d % are server-side and include ALL usage — chat plus code.\n\n"
+            "5h / 7d % come from Claude Code itself (status line) or, while it is "
+            "idle, a read-only call to the usage API. Both cover ALL usage — chat "
+            "plus code. This app never refreshes or writes your login token.\n\n"
             "$ values come only from local Claude Code transcripts: an equivalent "
             "API value, excluding chat.\n\n"
-            "Polling cadence: 6 min for the API, 30 s for local JSONL.\n\n"
+            "Cadence: status line live; API at most every 6 min (every 30 min while "
+            "the status line is live); local JSONL every 30 s.\n\n"
             "MIT license."
         ),
         # ---- Toast notifications ----
@@ -152,9 +173,11 @@ LANGUAGES: dict[str, dict[str, str]] = {
         "lbl_model_weekly": "{name} 周配额",
         "resets_at": "{time} 重置 · 剩 {left}",
         "updated_ago": "{age}前更新",
+        "via_statusline": "来自状态栏",
+        "via_api": "来自 API",
         # ---- Staleness / token-expired state ----
         "stale_mark": "数据旧",
-        "stale_token": "登录刷新失败 · 若持续请打开 Claude Code",
+        "stale_token": "登录已过期 · 打开 Claude Code 即可恢复配额",
         "stale_generic": "配额数据已过期 · {age}前",
         # ---- Settings window ----
         "settings_title": "设置",
@@ -177,10 +200,27 @@ LANGUAGES: dict[str, dict[str, str]] = {
         "strip_drag_on": "拖动模式：开（拖动状态条）",
         "strip_drag_off": "拖动模式：关",
         "strip_reset_pos": "重置位置",
+        "strip_embed": "嵌入任务栏内部（实验性）",
+        "strip_embed_hint": "作为任务栏的子窗口：不会被遮挡，也不需要置顶轮询。"
+                            "如果在你的 Windows 版本上表现异常请关闭。",
+        # ---- Quota source ----
+        "quota_source": "配额数据来源",
+        "src_statusline": "Claude Code 状态栏（推荐）",
+        "src_statusline_hint": "不需要 token，实时更新。会在 ~/.claude/settings.json 里"
+                               "添加 statusLine（你原来的状态栏照常显示）。",
+        "src_api": "后备：Claude Code 空闲时只读调用用量 API",
+        "src_state_off": "状态栏：未安装",
+        "src_state_waiting": "状态栏：已安装，等待 Claude Code 会话",
+        "src_state_live": "状态栏：实时 · {age}前更新",
+        "src_state_idle": "状态栏：空闲 · 上次更新 {age}前",
+        "src_install_failed": "无法修改 ~/.claude/settings.json，详见日志",
         "about_blurb": (
-            "5h / 7d 百分比来自服务端，涵盖全部用量——chat 加 code。\n\n"
+            "5h / 7d 百分比来自 Claude Code 本身（状态栏），Claude Code 空闲时改为"
+            "只读调用用量 API。两者都涵盖全部用量——chat 加 code。"
+            "本程序从不刷新或写入你的登录 token。\n\n"
             "$ 金额仅来自本地 Claude Code 会话记录：等效 API 价值，不含 chat。\n\n"
-            "轮询节奏：API 每 6 分钟，本地 JSONL 每 30 秒。\n\n"
+            "节奏：状态栏实时；API 最多每 6 分钟一次（状态栏活跃时每 30 分钟）；"
+            "本地 JSONL 每 30 秒。\n\n"
             "MIT 许可证。"
         ),
         # ---- Toast notifications ----
@@ -227,10 +267,19 @@ def usage_age_seconds(last_api_fetch: float) -> int:
     return int(_t.time() - last_api_fetch)
 
 
+def token_blocks_quota(s) -> bool:
+    """True when an expired/rejected Claude Code token is what's keeping the
+    quota from updating — i.e. the API fallback is on, it is the source of the
+    shown data, and the statusline source isn't covering for it."""
+    return (getattr(s, "token_expired", False)
+            and getattr(s, "api_enabled", True)
+            and getattr(s, "usage_source", "") != "statusline")
+
+
 def is_usage_stale(s) -> bool:
     """True when the displayed quota is old enough to flag — either the data has
-    aged past STALE_AFTER_SEC, or token refresh is currently blocked/failing."""
-    if getattr(s, "token_expired", False):
+    aged past STALE_AFTER_SEC, or the API fallback is blocked on an expired token."""
+    if token_blocks_quota(s):
         return True
     age = usage_age_seconds(s.last_api_fetch)
     return age < 0 or age > STALE_AFTER_SEC
@@ -290,7 +339,7 @@ STRIP_GAP_FROM_TASKBAR = 0  # legacy: gap between strip bottom and taskbar top
 
 # ---- Persistent config (just strip position for now) ----
 # Lives next to the script so it's easy to find / delete / reset.
-CONFIG_PATH = Path(__file__).parent / "config.json"
+CONFIG_PATH = app_dir() / "config.json"
 
 
 def load_config() -> dict:
@@ -326,7 +375,9 @@ def set_app_language(lang: str) -> None:
 # also recognizes any pre-existing user-made launcher (.lnk / .bat / .cmd / .vbs)
 # that references this app.py, so the checkbox reflects an autostart the user set
 # up manually and unchecking removes whichever file we found.
-APP_PY = Path(__file__).resolve()
+# When frozen (PyInstaller exe) the "app" is the exe itself; from source it's
+# app.py launched through pythonw.exe.
+APP_PY = Path(sys.executable).resolve() if FROZEN else Path(__file__).resolve()
 APP_DIR = APP_PY.parent
 STARTUP_SHORTCUT_NAME = "ClaudeUsageMonitor.lnk"
 # CreateProcess flag to suppress the brief console window when we shell out to
@@ -345,6 +396,13 @@ def pythonw_path() -> str:
     sys.executable if pythonw isn't found alongside it."""
     cand = Path(sys.executable).with_name("pythonw.exe")
     return str(cand) if cand.is_file() else sys.executable
+
+
+def launch_command() -> tuple[str, str]:
+    """(TargetPath, Arguments) for a shortcut that starts this app."""
+    if FROZEN:
+        return str(APP_PY), ""
+    return pythonw_path(), f'"{APP_PY}"'
 
 
 def _run_powershell(script: str) -> str | None:
@@ -422,7 +480,8 @@ def is_autostart_enabled(directory: Path | None = None) -> bool:
 
 
 def create_autostart_entry(directory: Path | None = None) -> Path | None:
-    """Create the canonical Startup shortcut launching this app via pythonw.exe.
+    """Create the canonical Startup shortcut launching this app (the exe when
+    frozen, otherwise app.py via pythonw.exe).
     Returns the shortcut Path on success, None on failure (logged, never raises)."""
     directory = directory or startup_dir()
     try:
@@ -431,12 +490,12 @@ def create_autostart_entry(directory: Path | None = None) -> Path | None:
         logging.getLogger(__name__).warning("cannot create startup dir: %s", e)
         return None
     lnk = directory / STARTUP_SHORTCUT_NAME
-    target = pythonw_path()
+    target, arguments = launch_command()
     script = (
         "$s=New-Object -ComObject WScript.Shell;"
         f"$sc=$s.CreateShortcut('{lnk}');"
         f"$sc.TargetPath='{target}';"
-        f"$sc.Arguments='\"{APP_PY}\"';"
+        f"$sc.Arguments='{arguments}';"
         f"$sc.WorkingDirectory='{APP_DIR}';"
         "$sc.Save()"
     )
@@ -496,6 +555,50 @@ _user32.SystemParametersInfoW.argtypes = [
     wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT,
 ]
 _user32.SystemParametersInfoW.restype = wintypes.BOOL
+
+# ---- Taskbar embedding (experimental, opt-in) ----
+# Instead of fighting the taskbar for z-order, the strip can become a CHILD
+# window of the taskbar (Shell_TrayWnd) — the approach TrafficMonitor and
+# Deskband11Lib use on Win11. A child of the taskbar is drawn as part of it, so
+# nothing can cover it and no topmost polling is needed. Downsides: it relies on
+# undocumented shell internals, some security software blocks it, and an
+# explorer.exe restart destroys the child (our tick self-heal re-creates and
+# re-embeds it). Any failure falls back to the classic topmost mode.
+_GWL_STYLE = -16
+_WS_CHILD = 0x40000000
+_WS_POPUP = 0x80000000
+_HWND_TOP = 0
+_user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+_user32.FindWindowW.restype = wintypes.HWND
+_user32.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
+_user32.SetParent.restype = wintypes.HWND
+_user32.GetParent.argtypes = [wintypes.HWND]
+_user32.GetParent.restype = wintypes.HWND
+_user32.IsWindow.argtypes = [wintypes.HWND]
+_user32.IsWindow.restype = wintypes.BOOL
+_user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+_user32.GetWindowRect.restype = wintypes.BOOL
+# 64-bit Windows exports the *LongPtr* variants; 32-bit only the plain ones.
+if hasattr(_user32, "GetWindowLongPtrW"):
+    _GetWindowLong = _user32.GetWindowLongPtrW
+    _SetWindowLong = _user32.SetWindowLongPtrW
+    _LONG_T = ctypes.c_ssize_t
+else:  # pragma: no cover — 32-bit Python
+    _GetWindowLong = _user32.GetWindowLongW
+    _SetWindowLong = _user32.SetWindowLongW
+    _LONG_T = ctypes.c_long
+_GetWindowLong.argtypes = [wintypes.HWND, ctypes.c_int]
+_GetWindowLong.restype = _LONG_T
+_SetWindowLong.argtypes = [wintypes.HWND, ctypes.c_int, _LONG_T]
+_SetWindowLong.restype = _LONG_T
+
+
+def find_taskbar_hwnd() -> int:
+    """HWND of the primary taskbar, or 0 if the shell isn't up (yet)."""
+    try:
+        return int(_user32.FindWindowW("Shell_TrayWnd", None) or 0)
+    except OSError:
+        return 0
 
 # kernel32 for the single-instance named mutex (see main()). CreateMutexW takes a
 # LPSECURITY_ATTRIBUTES (NULL here), a BOOL initial-owner, and the name; the HANDLE
@@ -1198,7 +1301,7 @@ class FloatingWindow:
         if stale:
             # Actionable: auth-stale means automatic refresh could not currently
             # produce live data; other stale causes (network, 429) show age only.
-            if getattr(s, "token_expired", False):
+            if token_blocks_quota(s):
                 self.footer.config(text=t("stale_token"), fg=WARN)
             else:
                 self.footer.config(
@@ -1207,9 +1310,11 @@ class FloatingWindow:
         elif s.usage_error and u is None:
             self.footer.config(text=s.usage_error[:60], fg=DANGER)
         else:
-            self.footer.config(
-                text=(t("updated_ago").format(age=fmt_age(age)) if age >= 0 else ""),
-                fg=FG_DIM)
+            text = t("updated_ago").format(age=fmt_age(age)) if age >= 0 else ""
+            src = getattr(s, "usage_source", "")
+            if text and src in ("statusline", "api"):
+                text += " · " + t("via_statusline" if src == "statusline" else "via_api")
+            self.footer.config(text=text, fg=FG_DIM)
 
 
 class TaskbarStrip:
@@ -1252,6 +1357,11 @@ class TaskbarStrip:
         # Configurable via Settings → Strip; defaults to the module-level STRIP_SIDE.
         raw_side = cfg.get("side", STRIP_SIDE)
         self.side = raw_side if raw_side in ("left", "right") else STRIP_SIDE
+        # Experimental: live inside the taskbar as its child window (see
+        # find_taskbar_hwnd). _embedded_parent is the taskbar HWND while
+        # embedded, 0 otherwise (classic topmost mode, also the fallback).
+        self.embed = bool(cfg.get("embed", False))
+        self._embedded_parent = 0
 
         # Font instances (not just tuples) so we can call .measure() during
         # layout. They're interpreter-level and survive a window teardown, so
@@ -1292,6 +1402,7 @@ class TaskbarStrip:
         self.win.attributes("-transparentcolor", TRANSPARENT_KEY)
 
         # Per-window render/layout state — reset for the fresh window.
+        self._embedded_parent = 0
         self.strip_w = STRIP_W
         self._render_sig: tuple | None = None
         self._applied_geom: tuple[int, int, int] | None = None
@@ -1328,6 +1439,8 @@ class TaskbarStrip:
         # (Re)assert position + topmost. The burst counters post-create races:
         # the shell still settling at boot, or the taskbar reclaiming topmost
         # right after a session switch.
+        if self.embed:
+            self._try_embed()
         self._reposition()
         for delay_ms in (300, 700, 1500, 3000, 6000, 10000):
             self.win.after(delay_ms, self._startup_bump)
@@ -1338,6 +1451,108 @@ class TaskbarStrip:
             return bool(self.win.winfo_exists())
         except tk.TclError:
             return False
+
+    # ---- experimental taskbar embedding ----
+
+    def _hwnd(self) -> int:
+        try:
+            return int(self.win.wm_frame(), 16)
+        except (ValueError, tk.TclError):
+            return 0
+
+    def _try_embed(self) -> bool:
+        """Re-parent the strip into the taskbar. True on success; on failure the
+        strip simply stays in classic topmost mode (and the tick retries)."""
+        log = logging.getLogger(__name__)
+        tray = find_taskbar_hwnd()
+        if not tray:
+            return False
+        try:
+            self.win.update_idletasks()
+        except tk.TclError:
+            return False
+        hwnd = self._hwnd()
+        if not hwnd:
+            return False
+        try:
+            old_style = _GetWindowLong(hwnd, _GWL_STYLE)
+            # MSDN: clear WS_POPUP and set WS_CHILD *before* SetParent.
+            new_style = (old_style & ~_WS_POPUP) | _WS_CHILD
+            _SetWindowLong(hwnd, _GWL_STYLE, _LONG_T(new_style).value)
+            _user32.SetParent(hwnd, tray)
+            ok = int(_user32.GetParent(hwnd) or 0) == tray
+        except OSError:
+            ok = False
+        if not ok:
+            try:
+                _SetWindowLong(hwnd, _GWL_STYLE, old_style)
+            except (OSError, UnboundLocalError):
+                pass
+            log.warning("strip: taskbar embedding failed; using topmost mode")
+            return False
+        self._embedded_parent = tray
+        self._applied_geom = None
+        log.info("strip: embedded into taskbar (hwnd %#x)", tray)
+        return True
+
+    def _embed_healthy(self) -> bool:
+        """True while we're still a child of a live taskbar window."""
+        parent = self._embedded_parent
+        if not parent:
+            return False
+        try:
+            return bool(_user32.IsWindow(parent)) and \
+                int(_user32.GetParent(self._hwnd()) or 0) == parent
+        except OSError:
+            return False
+
+    def _reposition_embedded(self, force: bool = False) -> None:
+        """Place the strip inside the taskbar, in TASKBAR-CLIENT coordinates
+        (a child window's position is relative to its parent). Uses
+        SetWindowPos directly rather than tk geometry, whose coordinates assume
+        a top-level window."""
+        rect = wintypes.RECT()
+        if not _user32.GetWindowRect(self._embedded_parent, ctypes.byref(rect)):
+            return
+        tb_w = rect.right - rect.left
+        tb_h = rect.bottom - rect.top
+        x = (STRIP_SIDE_MARGIN if self.side == "left"
+             else max(0, tb_w - self.strip_w - STRIP_SIDE_MARGIN))
+        y = max(0, (tb_h - STRIP_H) // 2)
+        geom = ("embedded", self.strip_w, x, y)
+        if geom == self._applied_geom and not force:
+            return
+        self._applied_geom = geom
+        flags = _SWP_NOACTIVATE | (_SWP_SHOWWINDOW if self.visible else 0)
+        try:
+            # HWND_TOP: above the taskbar's own children (on Win11 the XAML
+            # content bridge covers the whole bar).
+            _user32.SetWindowPos(self._hwnd(), _HWND_TOP, x, y,
+                                 self.strip_w, STRIP_H, flags)
+        except OSError:
+            pass
+
+    def set_embed(self, enabled: bool) -> None:
+        """Toggle taskbar embedding and persist. Turning it off rebuilds the
+        window from scratch — cleaner than un-parenting a child in place."""
+        self.embed = bool(enabled)
+        cfg = load_config()
+        cfg.setdefault("strip", {})
+        cfg["strip"]["embed"] = self.embed
+        save_config(cfg)
+        if self.embed:
+            if self.drag_mode:
+                self.set_drag_mode(False)
+            if self._win_alive() and not self._embedded_parent:
+                self._try_embed()
+            self._reposition()
+        elif self._embedded_parent:
+            try:
+                self.win.destroy()
+            except tk.TclError:
+                pass
+            self._create_window()
+            self._render_sig = None
 
     def _validate_custom_pos(self) -> None:
         """Snap a saved position back on-screen if it's fully off-screen (e.g.
@@ -1384,6 +1599,9 @@ class TaskbarStrip:
         drag_active = self.drag_mode and self._drag_anchor is not None
         if drag_active:
             return
+        if self._embedded_parent:
+            self._reposition_embedded()
+            return
         if self._custom_pos is not None:
             x, y = self._custom_pos
         else:
@@ -1410,7 +1628,7 @@ class TaskbarStrip:
         pattern for keeping a Toplevel reliably above other windows; raw
         SetWindowPos / ShowWindow / deiconify combinations are less reliable.
         """
-        if not self.visible:
+        if not self.visible or self._embedded_parent:
             return
         try:
             self.win.attributes("-topmost", False)
@@ -1430,7 +1648,7 @@ class TaskbarStrip:
         on top, so we call it speculatively in the startup burst and
         defensively whenever _is_covered() returns True.
         """
-        if not self.visible:
+        if not self.visible or self._embedded_parent:
             return
         try:
             hwnd = int(self.win.wm_frame(), 16)
@@ -1460,7 +1678,7 @@ class TaskbarStrip:
         Returns True only if *no* sample point reports us — i.e., we're
         confidently covered. False if at least one point shows us on top.
         """
-        if not self.visible:
+        if not self.visible or self._embedded_parent:
             return False
         try:
             our_hwnd = int(self.win.wm_frame(), 16)
@@ -1534,7 +1752,7 @@ class TaskbarStrip:
         self._menu.add_command(label=t("hide_strip"), command=self.hide)
 
     def _on_btn1_press(self, event) -> None:
-        if self.drag_mode:
+        if self.drag_mode and not self._embedded_parent:
             # Capture both mouse origin and current window origin so motion
             # math is a simple delta.
             self._drag_anchor = (
@@ -1574,7 +1792,10 @@ class TaskbarStrip:
 
     def set_drag_mode(self, enabled: bool) -> None:
         """Toggle drag-to-reposition mode. Visual cues: 4-way move cursor on
-        hover, plus a thin ACCENT-colored outline rectangle drawn by _render."""
+        hover, plus a thin ACCENT-colored outline rectangle drawn by _render.
+        Unavailable while embedded in the taskbar (position is managed there)."""
+        if enabled and self._embedded_parent:
+            enabled = False
         self.drag_mode = enabled
         cursor = "fleur" if enabled else ""
         try:
@@ -1670,7 +1891,25 @@ class TaskbarStrip:
                     "recreating")
                 self._create_window()
             self._render(self.orch.snapshot())
-            if self.visible:
+            if self.embed:
+                if self._embedded_parent and not self._embed_healthy():
+                    # Taskbar recreated (explorer restart) without taking our
+                    # window down with it — drop back and re-embed below.
+                    logging.getLogger(__name__).warning(
+                        "strip: lost taskbar parent; re-embedding")
+                    self._embedded_parent = 0
+                    self._applied_geom = None
+                if not self._embedded_parent:
+                    # Retry every ~5 s (e.g. shell not up yet at autostart).
+                    self._embed_retry = getattr(self, "_embed_retry", 0) + 1
+                    if self._embed_retry % 5 == 0:
+                        self._try_embed()
+            if self.visible and self._embedded_parent:
+                self._tick_count += 1
+                # Re-assert position/z-order inside the taskbar now and then
+                # (cheap; the shell can reshuffle its children).
+                self._reposition_embedded(force=self._tick_count % 5 == 0)
+            elif self.visible:
                 self._tick_count += 1
                 self._reposition()
                 # Topmost policy (A3): only do the disruptive off→on toggle when we
@@ -1874,6 +2113,7 @@ class SettingsWindow:
     """
 
     _instance: "SettingsWindow | None" = None
+    WIN_W, WIN_H = 450, 680
 
     @classmethod
     def open(cls, root: tk.Tk, orch: Orchestrator, strip,
@@ -1905,7 +2145,8 @@ class SettingsWindow:
         # Borderless like the main window; +45px height for the custom title bar.
         self.win.overrideredirect(True)
         sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
-        self.win.geometry(f"430x515+{(sw - 430) // 2}+{max(0, (sh - 515) // 2)}")
+        self.win.geometry(f"{self.WIN_W}x{self.WIN_H}+{(sw - self.WIN_W) // 2}"
+                          f"+{max(0, (sh - self.WIN_H) // 2)}")
         self.win.resizable(False, False)
         # NOTE: no transient(root) — a transient + overrideredirect Toplevel
         # fails to map on Windows (stays 1x1 and never becomes viewable).
@@ -2117,6 +2358,26 @@ class SettingsWindow:
         self.startup_cb.config(state="disabled")
         self._run_async(is_autostart_enabled, self._apply_startup_detected)
 
+        # Quota source: statusline bridge (primary) + read-only API fallback.
+        # Detection and install/uninstall touch ~/.claude/settings.json — tiny
+        # local file ops, but still run off-thread like the autostart calls.
+        self._section(inner, t("quota_source"))
+        self.sl_var = tk.BooleanVar(value=False)
+        self.sl_cb = self._checkbox(inner, t("src_statusline"), self.sl_var,
+                                    self._on_statusline_toggle)
+        self.sl_cb.config(state="disabled")
+        self._hint(inner, t("src_statusline_hint"))
+        self.sl_state_lbl = tk.Label(inner, text="", bg=BG, fg=FG_DIM,
+                                     font=("Segoe UI", 8), anchor="w")
+        self.sl_state_lbl.pack(anchor="w", padx=(24, 0))
+        self.api_var = tk.BooleanVar(value=self.orch.snapshot().api_enabled)
+        self._checkbox(inner, t("src_api"), self.api_var, self._on_api_toggle)
+        self._sl_installed: bool | None = None
+        self._run_async(statusline.is_installed, self._apply_statusline_detected)
+        if not getattr(self, "_sl_tick_started", False):
+            self._sl_tick_started = True
+            self.win.after(5000, self._tick_sl_state)
+
         # Version + project page
         self._section(inner, t("version_label"))
         tk.Label(inner, text=f"v{__version__}", bg=BG, fg=FG,
@@ -2162,6 +2423,85 @@ class SettingsWindow:
                 pass
         self._run_async(work, done)
 
+    def _hint(self, parent: tk.Frame, text: str) -> tk.Label:
+        lbl = tk.Label(parent, text=text, bg=BG, fg=FG_DIM, font=("Segoe UI", 8),
+                       justify="left", anchor="w", wraplength=self.WIN_W - 70)
+        lbl.pack(anchor="w", padx=(24, 0))
+        return lbl
+
+    def _update_sl_state(self, error: str = "") -> None:
+        if error:
+            self.sl_state_lbl.config(text=error, fg=DANGER)
+            return
+        if not self._sl_installed:
+            self.sl_state_lbl.config(text=t("src_state_off"), fg=FG_DIM)
+            return
+        snap = self.orch.snapshot()
+        if not snap.last_statusline:
+            self.sl_state_lbl.config(text=t("src_state_waiting"), fg=WARN)
+            return
+        age = fmt_age(usage_age_seconds(snap.last_statusline))
+        if snap.statusline_fresh():
+            self.sl_state_lbl.config(text=t("src_state_live").format(age=age), fg=OK)
+        else:
+            self.sl_state_lbl.config(text=t("src_state_idle").format(age=age), fg=FG_DIM)
+
+    def _tick_sl_state(self) -> None:
+        if not self._alive():
+            return
+        try:
+            if self._sl_installed is not None:
+                self._update_sl_state()
+        except tk.TclError:
+            pass
+        self.win.after(5000, self._tick_sl_state)
+
+    def _apply_statusline_detected(self, installed) -> None:
+        self._sl_installed = bool(installed)
+        self.sl_var.set(self._sl_installed)
+        try:
+            self.sl_cb.config(state="normal")
+        except tk.TclError:
+            pass
+        self._update_sl_state()
+
+    def _on_statusline_toggle(self) -> None:
+        want = bool(self.sl_var.get())
+        try:
+            self.sl_cb.config(state="disabled")
+        except tk.TclError:
+            pass
+
+        def work():
+            try:
+                (statusline.install if want else statusline.uninstall)()
+                return True
+            except Exception:  # noqa: BLE001 — surface in the UI, details in log
+                logging.getLogger(__name__).exception("statusline %s failed",
+                                                      "install" if want else "uninstall")
+                return False
+
+        def done(ok) -> None:
+            if ok:
+                self._sl_installed = want
+                self._update_sl_state()
+            else:
+                self.sl_var.set(not want)
+                self._update_sl_state(error=t("src_install_failed"))
+            try:
+                self.sl_cb.config(state="normal")
+            except tk.TclError:
+                pass
+        self._run_async(work, done)
+
+    def _on_api_toggle(self) -> None:
+        enabled = bool(self.api_var.get())
+        self.orch.set_api_enabled(enabled)
+        cfg = load_config()
+        cfg.setdefault("quota", {})
+        cfg["quota"]["api_fallback"] = enabled
+        save_config(cfg)
+
     def _on_project_page(self) -> None:
         try:
             webbrowser.open(PROJECT_URL)
@@ -2185,6 +2525,10 @@ class SettingsWindow:
         self.strip_bg_var = tk.BooleanVar(value=bool(strip and strip.show_background))
         self._checkbox(inner, t("strip_opaque_bg"), self.strip_bg_var,
                        self._on_strip_bg)
+        self.strip_embed_var = tk.BooleanVar(value=bool(strip and strip.embed))
+        self._checkbox(inner, t("strip_embed"), self.strip_embed_var,
+                       self._on_strip_embed)
+        self._hint(inner, t("strip_embed_hint"))
 
         # Screen position
         self._section(inner, t("strip_screen_pos"))
@@ -2238,6 +2582,19 @@ class SettingsWindow:
     def _on_strip_bg(self) -> None:
         if self.strip:
             self._marshal(lambda: self.strip.set_show_background(bool(self.strip_bg_var.get())))
+
+    def _on_strip_embed(self) -> None:
+        if not self.strip:
+            return
+        want = bool(self.strip_embed_var.get())
+
+        def apply() -> None:
+            self.strip.set_embed(want)
+            try:
+                self.drag_btn.config(text=self._drag_label())
+            except tk.TclError:
+                pass
+        self._marshal(apply)
 
     def _on_strip_side(self) -> None:
         if self.strip:
@@ -2427,7 +2784,7 @@ def _setup_logging() -> None:
     root.addHandler(sh)
     try:
         from logging.handlers import RotatingFileHandler
-        log_path = Path(__file__).with_name("cc-usage-tray.log")
+        log_path = app_dir() / "cc-usage-tray.log"
         fh = RotatingFileHandler(log_path, maxBytes=512 * 1024, backupCount=3,
                                  encoding="utf-8")
         fh.setFormatter(fmt)
@@ -2460,7 +2817,8 @@ def main() -> int:
     if isinstance(saved_lang, str) and saved_lang in LANGUAGES:
         _current_lang = saved_lang
 
-    orch = Orchestrator()
+    api_enabled = load_config().get("quota", {}).get("api_fallback", True)
+    orch = Orchestrator(api_enabled=bool(api_enabled))
     # Wire callbacks AFTER constructing window+tray so we can reference them.
     window = FloatingWindow(orch, on_close=lambda: None)
 

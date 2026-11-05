@@ -1,9 +1,19 @@
-"""State orchestrator: background threads fetch usage data, UI consumes a snapshot.
+"""State orchestrator: background threads gather usage data, UI consumes a snapshot.
+
+Quota sources, in priority order:
+  1. Claude Code statusLine bridge (statusline.py) — token-free, no network,
+     updates on every status refresh while a Claude Code session is running.
+  2. READ-ONLY poll of /api/oauth/usage — covers idle periods (and chat/web
+     usage made while no Claude Code session is open) plus model-scoped weekly
+     buckets. Uses whatever access token Claude Code currently has on disk and
+     NEVER refreshes it. Can be switched off entirely.
 
 Threading model:
   - Main thread: owns the tkinter UI loop (started elsewhere).
-  - API thread: polls /api/oauth/usage (rate-limited, so every API_INTERVAL_SEC).
-  - JSONL thread: re-parses ~/.claude/projects (cheap, every JSONL_INTERVAL_SEC).
+  - statusline thread: watches the capture file's mtime (cheap local stat).
+  - api thread: polls the usage endpoint, throttled hard while the statusline
+    source is fresh.
+  - jsonl thread: re-parses ~/.claude/projects (cheap, every JSONL_INTERVAL_SEC).
   - All threads write to AppState fields under _lock; UI reads via snapshot().
 """
 from __future__ import annotations
@@ -18,204 +28,302 @@ from pathlib import Path
 from typing import Callable
 
 from jsonl_costs import UsageReport, build_report
-from usage_api import (
-    OAuthCreds, UsageSnapshot, fetch_usage, load_oauth_creds, refresh_and_save,
-    snapshot_from_body,
-)
+from paths import app_dir
+from statusline import CAPTURE_PATH, body_from_capture, read_capture
+from usage_api import UsageSnapshot, fetch_usage, load_oauth_creds, snapshot_from_body
 
 log = logging.getLogger(__name__)
 
-# Last-good usage snapshot persisted next to the scripts. Lets the UI show the
-# most recent known quota (with an honest age) immediately on launch, instead of
-# blanking until the first network fetch succeeds — which after an overnight boot
-# always needs a token refresh first and can be delayed by a boot-time network
-# race or a refresh cooldown.
-USAGE_CACHE_PATH = Path(__file__).parent / "usage_cache.json"
+# Last-good usage snapshot persisted next to the program. Lets the UI show the
+# most recent known quota (with an honest age) immediately on launch.
+USAGE_CACHE_PATH = app_dir() / "usage_cache.json"
 
 # Fast-retry ladder (seconds) used when the first fetch hasn't succeeded yet or a
-# network-class error occurs, so quota appears promptly once connectivity / the
-# refresh cooldown clears. Indexed by consecutive-failure count; past the end we
-# fall back to the normal API_INTERVAL_SEC cadence. HTTP 429 and invalid_grant
-# are NOT laddered — they keep their long absolute backoff timestamps.
+# network-class error occurs. Indexed by consecutive-failure count; past the end
+# we fall back to the normal API_INTERVAL_SEC cadence. HTTP 429 is NOT laddered.
 RETRY_LADDER_SEC = (5, 15, 30, 60)
 
-# Polling intervals. The OAuth usage endpoint is rate-limited to ~5 req per token,
-# but a fresh token is issued ~every 8h so we have a budget of ~5/8h = ~1 req per 90 min.
-# We're more aggressive than that and rely on the token-refresh flow to bail us out
-# when we get 429ed. 360s = 6 min is what CodeZeno uses by default.
+# API polling cadence when it's the only live source. The endpoint is
+# aggressively rate-limited (~5 req per token), 6 min is the community default.
 API_INTERVAL_SEC = 360
+# While the statusline source is fresh it already gives us live 5h/7d numbers;
+# the API is then only consulted this often (for model-scoped buckets).
+API_INTERVAL_WITH_STATUSLINE_SEC = 1800
+# The statusline capture counts as "fresh" (a Claude Code session is active)
+# for this long after its last update.
+STATUSLINE_FRESH_SEC = 600
+# How often the statusline thread stats the capture file. Local, no network.
+STATUSLINE_POLL_SEC = 2
 JSONL_INTERVAL_SEC = 30
-# Backoff applied after we get rate-limited (HTTP 429). The /api/oauth/usage
-# endpoint allows roughly 5 requests per token lifetime; once we trip it, the
-# only way out is usually a fresh token. Wait 15 minutes before trying again.
+# When the on-disk access token is expired we deliberately DO NOT refresh it
+# (see usage_api's module docstring). We re-read the file this often — a cheap
+# local read — and recover as soon as Claude Code writes a fresh token.
+TOKEN_RECHECK_SEC = 45
+# Backoff applied after HTTP 429 from the usage endpoint.
 RATE_LIMIT_BACKOFF_SEC = 900
-# Don't try OAuth refresh more often than this. It prevents thrashing Anthropic
-# if the machine is offline and reduces the chance of racing Claude Code's own
-# token rotation.
-MIN_REFRESH_INTERVAL_SEC = 300
-# If refresh returns invalid_grant and the credentials file has not already been
-# updated by another process, the user likely needs a fresh Claude Code login.
-INVALID_GRANT_BACKOFF_SEC = 3600
+
+# raw-body keys carried over from the previous snapshot when a statusline
+# capture (which only has five_hour / seven_day) replaces it, so model-scoped
+# buckets learned from the API don't blink out between API polls.
+_CARRY_OVER_KEYS = ("limits", "seven_day_opus", "seven_day_sonnet", "extra_usage")
+
+SOURCE_STATUSLINE = "statusline"
+SOURCE_API = "api"
 
 
 @dataclass
 class AppState:
     """Shared mutable state. Always accessed under lock when mutating."""
 
-    usage: UsageSnapshot | None = None         # Most recent API snapshot, or None pre-first-fetch.
-    usage_error: str = ""                      # Last error message, "" if last fetch was ok.
-    # True while auth cannot currently produce a live usage fetch: expired token,
-    # rejected token, refresh cooldown, or refresh failure. The UI marks the last
-    # good quota snapshot as stale instead of pretending it is live.
+    usage: UsageSnapshot | None = None         # Most recent quota snapshot (either source).
+    usage_error: str = ""                      # Last API error message, "" if ok.
+    # True while the API fallback can't run because Claude Code's access token
+    # is expired/rejected. Only meaningful when usage_source == "api".
     token_expired: bool = False
     report: UsageReport | None = None          # Most recent JSONL aggregation.
     report_error: str = ""
+    # Timestamp of the data currently shown (API fetch time, or statusline
+    # capture time). The UI's "updated Xm ago" / stale logic reads this.
     last_api_fetch: float = 0.0
     last_jsonl_parse: float = 0.0
-    # Don't call the API again until this Unix timestamp. Set when we hit a 429
-    # or a hard auth refresh failure.
+    # Which source produced `usage`: "statusline", "api", or "" (none yet).
+    usage_source: str = ""
+    # Most recent statusline capture time seen (0 = never).
+    last_statusline: float = 0.0
+    # Most recent SUCCESSFUL API fetch (0 = never this run).
+    last_api_success: float = 0.0
+    api_enabled: bool = True
+    # Don't call the API again until this Unix timestamp (after a 429).
     api_backoff_until: float = 0.0
-    # Last time we attempted an OAuth refresh. Used to rate-limit refreshes.
-    last_refresh_attempt: float = 0.0
     # Last alert state per threshold key — used to fire each threshold only once per crossing.
     alerted_5h: set[int] = field(default_factory=set)
     alerted_7d: set[int] = field(default_factory=set)
     # Same, for model-scoped weekly buckets (Fable, …), keyed by bucket name.
     alerted_scoped: dict[str, set[int]] = field(default_factory=dict)
 
+    def statusline_fresh(self, now: float | None = None) -> bool:
+        if not self.last_statusline:
+            return False
+        return ((now or time.time()) - self.last_statusline) < STATUSLINE_FRESH_SEC
+
 
 class Orchestrator:
-    """Owns the two background threads and the shared state.
+    """Owns the background threads and the shared state.
 
     Notification callback `on_alert(kind, pct)` is called when a threshold crossing happens.
-      kind in {"5h_75", "5h_90", "5h_95", "7d_75", "7d_90", "7d_95"}.
+      kind in {"5h_75", …, "7d_95"} or "scoped:<name>:<thresh>".
     """
 
     # Threshold percentages that trigger an alert (once per crossing).
     THRESHOLDS = (75, 90, 95)
 
     def __init__(self, on_change: Callable[[], None] | None = None,
-                 on_alert: Callable[[str, float], None] | None = None) -> None:
-        self.state = AppState()
+                 on_alert: Callable[[str, float], None] | None = None, *,
+                 api_enabled: bool = True,
+                 capture_path: Path = CAPTURE_PATH,
+                 cache_path: Path | None = None) -> None:
+        self.state = AppState(api_enabled=api_enabled)
         self._lock = threading.Lock()
         self._stop = threading.Event()
-        self._api_thread: threading.Thread | None = None
-        self._jsonl_thread: threading.Thread | None = None
+        self._threads: list[threading.Thread] = []
         self._on_change = on_change or (lambda: None)
         self._on_alert = on_alert or (lambda kind, pct: None)
+        self._capture_path = capture_path
+        self._cache_path = cache_path or USAGE_CACHE_PATH
         # Wake events let us trigger an immediate refresh outside the polling cadence.
         self._api_wake = threading.Event()
         self._jsonl_wake = threading.Event()
+        self._sl_wake = threading.Event()
+        # Set by refresh_now(): the next API cycle runs even if the statusline
+        # source is fresh. Only the api thread clears it.
+        self._force_api = False
         # Consecutive API-fetch failures — drives the fast-retry ladder. Only the
         # api thread touches it, so no lock needed.
         self._consecutive_failures = 0
-        # Seconds left on the refresh cooldown from the most recent cycle, set by
-        # _try_refresh() and read by _next_api_wait().
-        self._refresh_cooldown_left = 0.0
-        # Seed the UI with the last good snapshot from disk so quota shows up
-        # immediately (with an honest age) rather than blank until the first
-        # network fetch lands.
+        self._last_capture_mtime: int | None = None
         self._load_usage_cache()
 
     def start(self) -> None:
         self._stop.clear()
-        self._api_thread = threading.Thread(target=self._api_loop, name="api", daemon=True)
-        self._jsonl_thread = threading.Thread(target=self._jsonl_loop, name="jsonl", daemon=True)
-        self._api_thread.start()
-        self._jsonl_thread.start()
+        self._threads = [
+            threading.Thread(target=self._statusline_loop, name="statusline", daemon=True),
+            threading.Thread(target=self._api_loop, name="api", daemon=True),
+            threading.Thread(target=self._jsonl_loop, name="jsonl", daemon=True),
+        ]
+        for th in self._threads:
+            th.start()
 
     def stop(self) -> None:
         self._stop.set()
         self._api_wake.set()
         self._jsonl_wake.set()
+        self._sl_wake.set()
 
     def refresh_now(self) -> None:
-        """Manual trigger — used by the 'Refresh' menu item. Wakes both loops."""
+        """Manual trigger — used by the 'Refresh' menu item. Wakes every loop and
+        lets the API fallback run once even if the statusline source is fresh."""
+        self._force_api = True
         self._api_wake.set()
         self._jsonl_wake.set()
+        self._sl_wake.set()
+
+    def set_api_enabled(self, enabled: bool) -> None:
+        """Turn the read-only API fallback on/off at runtime."""
+        with self._lock:
+            self.state.api_enabled = bool(enabled)
+            if not enabled:
+                self.state.token_expired = False
+                self.state.usage_error = ""
+        self._api_wake.set()
+        self._on_change()
 
     def snapshot(self) -> AppState:
         """Return a shallow copy of state for the UI to read without holding the lock."""
         with self._lock:
-            # AppState is small; copy by reconstruction. The contained dataclasses are
-            # immutable in practice (we replace them whole rather than mutate in place).
+            s = self.state
             return AppState(
-                usage=self.state.usage,
-                usage_error=self.state.usage_error,
-                token_expired=self.state.token_expired,
-                report=self.state.report,
-                report_error=self.state.report_error,
-                last_api_fetch=self.state.last_api_fetch,
-                last_jsonl_parse=self.state.last_jsonl_parse,
-                api_backoff_until=self.state.api_backoff_until,
-                last_refresh_attempt=self.state.last_refresh_attempt,
-                alerted_5h=set(self.state.alerted_5h),
-                alerted_7d=set(self.state.alerted_7d),
-                alerted_scoped={k: set(v) for k, v in self.state.alerted_scoped.items()},
+                usage=s.usage,
+                usage_error=s.usage_error,
+                token_expired=s.token_expired,
+                report=s.report,
+                report_error=s.report_error,
+                last_api_fetch=s.last_api_fetch,
+                last_jsonl_parse=s.last_jsonl_parse,
+                usage_source=s.usage_source,
+                last_statusline=s.last_statusline,
+                last_api_success=s.last_api_success,
+                api_enabled=s.api_enabled,
+                api_backoff_until=s.api_backoff_until,
+                alerted_5h=set(s.alerted_5h),
+                alerted_7d=set(s.alerted_7d),
+                alerted_scoped={k: set(v) for k, v in s.alerted_scoped.items()},
             )
 
     # ---------- last-good snapshot persistence ----------
 
     def _load_usage_cache(self) -> None:
         """Seed state.usage from the on-disk last-good snapshot, if present and
-        valid. A missing cache is ignored silently (the normal first run); a
-        corrupt one is logged and ignored. Either way it is only an
-        optimization, never a correctness dependency."""
+        valid. Purely an optimization — never a correctness dependency."""
         try:
-            with open(USAGE_CACHE_PATH, encoding="utf-8") as f:
+            with open(self._cache_path, encoding="utf-8") as f:
                 data = json.load(f)
             raw = data["raw"]
             fetched_at = float(data["fetched_at"])
             if not isinstance(raw, dict):
                 return
             snap = snapshot_from_body(raw, fetched_at)
+            source = data.get("source")
         except FileNotFoundError:
-            return  # normal first run — no cache written yet, nothing to say
-        except Exception:  # noqa: BLE001
-            # Deliberately broad: this is a pure optimization, and a cache that
-            # trips an unforeseen parse error must never abort startup (we run
-            # before the threads, inside Orchestrator.__init__).
+            return  # normal first run
+        except Exception:  # noqa: BLE001 — must never abort startup
             log.warning("ignoring unreadable usage cache", exc_info=True)
             return
         # No lock needed: runs in __init__ before the threads start.
         self.state.usage = snap
         self.state.last_api_fetch = fetched_at
+        self.state.usage_source = source if source in (SOURCE_STATUSLINE, SOURCE_API) else SOURCE_API
         log.info("seeded usage from cache (age %ds)", int(time.time() - fetched_at))
 
-    def _save_usage_cache(self, snap: UsageSnapshot) -> None:
-        """Atomically persist the last good snapshot (tmp + Path.replace, same
-        crash-safe pattern as save_oauth_creds). Failures are non-fatal."""
+    def _save_usage_cache(self, snap: UsageSnapshot, source: str) -> None:
+        """Atomically persist the last good snapshot. Failures are non-fatal."""
         try:
-            payload = json.dumps({"raw": snap.raw, "fetched_at": snap.fetched_at})
-            tmp = USAGE_CACHE_PATH.with_suffix(".json.tmp")
+            payload = json.dumps({"raw": snap.raw, "fetched_at": snap.fetched_at,
+                                  "source": source})
+            tmp = self._cache_path.with_suffix(".json.tmp")
             tmp.write_text(payload, encoding="utf-8")
-            tmp.replace(USAGE_CACHE_PATH)
+            tmp.replace(self._cache_path)
         except OSError as e:
             log.warning("failed to persist usage cache: %s", e)
 
-    # ---------- background loops ----------
+    def _publish(self, snap: UsageSnapshot, source: str) -> None:
+        """Install a new snapshot from either source and notify listeners."""
+        with self._lock:
+            self.state.usage = snap
+            self.state.usage_source = source
+            self.state.last_api_fetch = snap.fetched_at
+            if source == SOURCE_API:
+                self.state.usage_error = ""
+                self.state.token_expired = False
+                self.state.last_api_success = snap.fetched_at
+        self._save_usage_cache(snap, source)
+        self._check_thresholds(snap)
+        self._on_change()
 
-    # Outcome codes returned by _do_fetch_cycle, consumed by _api_loop to pick
-    # the next wait. BACKOFF means an absolute backoff timestamp was already set
-    # (429 / invalid_grant) and the loop top will honor it — don't ladder.
+    # ---------- source 1: statusline bridge ----------
+
+    def _statusline_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.poll_statusline()
+            except Exception:  # noqa: BLE001 — keep the loop alive
+                log.exception("statusline poll failed")
+            self._sl_wake.wait(timeout=STATUSLINE_POLL_SEC)
+            self._sl_wake.clear()
+
+    def poll_statusline(self) -> bool:
+        """Ingest the capture file if it changed since the last look. Returns
+        True when a new snapshot was published. Public for tests."""
+        try:
+            mtime = self._capture_path.stat().st_mtime_ns
+        except OSError:
+            return False
+        if mtime == self._last_capture_mtime:
+            return False
+        self._last_capture_mtime = mtime
+        rec = read_capture(self._capture_path)
+        if rec is None:
+            return False
+        captured_at = float(rec["captured_at"])
+        body = body_from_capture(rec)
+        if body is None:
+            return False
+        with self._lock:
+            if captured_at > self.state.last_statusline:
+                self.state.last_statusline = captured_at
+            cur = self.state.usage
+            if cur is not None and cur.fetched_at >= captured_at:
+                return False  # what we show is already newer
+            if cur is not None and isinstance(cur.raw, dict):
+                for key in _CARRY_OVER_KEYS:
+                    if key not in body and key in cur.raw:
+                        body[key] = cur.raw[key]
+        snap = snapshot_from_body(body, captured_at)
+        self._publish(snap, SOURCE_STATUSLINE)
+        return True
+
+    # ---------- source 2: read-only usage API ----------
+
+    # Outcome codes returned by _do_fetch_cycle, consumed by _api_loop.
     _OUT_OK = "ok"
     _OUT_RETRYABLE = "retryable"       # network error, or any failure pre-first-success
-    _OUT_BACKOFF = "backoff"           # absolute backoff already set
-    _OUT_COOLDOWN = "cooldown"         # refresh on cooldown; short targeted wait
+    _OUT_BACKOFF = "backoff"           # absolute backoff already set (429)
+    _OUT_TOKEN_EXPIRED = "token_exp"   # disk token expired/rejected — wait, never refresh
+
+    def _api_hold_seconds(self, now: float) -> float:
+        """Seconds the API fallback should keep waiting before its next request
+        for reasons other than backoff (disabled, or statusline covering us)."""
+        if not self.state.api_enabled:
+            return 3600.0
+        if self._force_api:
+            return 0.0
+        if self.state.statusline_fresh(now):
+            left = API_INTERVAL_WITH_STATUSLINE_SEC - (now - self.state.last_api_success)
+            return max(0.0, left)
+        return 0.0
 
     def _api_loop(self) -> None:
         while not self._stop.is_set():
             now = time.time()
             backoff_left = self.state.api_backoff_until - now
-            if backoff_left > 0:
-                # In backoff (after a 429 or while token is expired). Sleep
-                # without burning more budget, but respond to manual wake-ups
-                # by re-evaluating at the next iteration top.
-                self._api_wake.wait(timeout=min(backoff_left, API_INTERVAL_SEC))
+            hold = self._api_hold_seconds(now)
+            if backoff_left > 0 or hold > 0:
+                # Re-evaluate at least every minute so we resume polling soon
+                # after Claude Code closes (statusline goes stale) or a wake.
+                self._api_wake.wait(timeout=min(max(backoff_left, hold), 60.0))
                 self._api_wake.clear()
                 continue
+            self._force_api = False
 
-            self._refresh_cooldown_left = 0.0
             try:
                 outcome = self._do_fetch_cycle()
             except urllib.error.URLError as e:
@@ -223,8 +331,6 @@ class Orchestrator:
                 outcome = self._OUT_RETRYABLE
             except (FileNotFoundError, ValueError) as e:
                 self._record_api_error(str(e))
-                # No creds / malformed creds: keep showing last-known data and
-                # retry on the fast ladder while usage is still unknown.
                 outcome = self._OUT_RETRYABLE if self.state.usage is None else self._OUT_OK
             except Exception as e:  # noqa: BLE001 — last-resort safety
                 self._record_api_error(f"{type(e).__name__}: {e}")
@@ -234,20 +340,17 @@ class Orchestrator:
             self._api_wake.clear()
 
     def _next_api_wait(self, outcome: str) -> float:
-        """Compute the delay before the next fetch attempt from this cycle's
-        outcome and the consecutive-failure count (A2.3 / A2.4)."""
+        """Delay before the next fetch attempt from this cycle's outcome."""
         if outcome == self._OUT_OK:
             self._consecutive_failures = 0
             return API_INTERVAL_SEC
-        if outcome == self._OUT_COOLDOWN:
-            # Wake shortly after the refresh cooldown lapses so the quota comes
-            # back quickly without retrying a failing refresh in a tight loop.
+        if outcome == self._OUT_TOKEN_EXPIRED:
+            # Wait-for-Claude-Code state, not a transient error: cheap disk
+            # re-reads, no network.
             self._consecutive_failures = 0
-            return min(max(self._refresh_cooldown_left, 0.0) + 2, API_INTERVAL_SEC)
+            return TOKEN_RECHECK_SEC
         if outcome == self._OUT_BACKOFF:
-            # An absolute api_backoff_until is set; the loop top enforces it.
             return API_INTERVAL_SEC
-        # _OUT_RETRYABLE: climb the fast ladder, then cap at the normal interval.
         idx = self._consecutive_failures
         self._consecutive_failures += 1
         if idx < len(RETRY_LADDER_SEC):
@@ -255,152 +358,34 @@ class Orchestrator:
         return API_INTERVAL_SEC
 
     def _do_fetch_cycle(self) -> str:
-        """One full API fetch cycle.
-
-        We piggyback Claude Code's OAuth credentials, but we no longer require a
-        terminal Claude Code session to refresh every ~8h. When the access token
-        expires, refresh_and_save() rotates it and atomically writes the new
-        access/refresh token back to ~/.claude/.credentials.json. The write path
-        verifies the refresh_token on disk is still the one we used, so we do not
-        overwrite a newer Claude Code login/refresh that landed while our network
-        request was in flight.
-        """
+        """One READ-ONLY API cycle: read Claude Code's current access token from
+        disk and call the usage endpoint with it. If the token is expired or
+        rejected we do not refresh it — we wait for Claude Code to rotate it."""
         creds = load_oauth_creds()
         if creds.is_expired():
-            with self._lock:
-                self.state.token_expired = True
-                self.state.usage_error = "token_expired_refreshing"
-            log.info("access token expired; refreshing OAuth credentials")
-            creds = self._try_refresh()
-            if creds is None:
-                return self._refresh_outcome()
-
+            self._mark_token_expired("token_expired")
+            return self._OUT_TOKEN_EXPIRED
         try:
             snap = fetch_usage(creds.access_token)
         except urllib.error.HTTPError as e:
             if e.code == 401:
-                with self._lock:
-                    self.state.token_expired = True
-                    self.state.usage_error = "token_rejected"
-                log.info("API returned 401; attempting OAuth refresh + retry")
-                creds = self._try_refresh()
-                if creds is None:
-                    return self._refresh_outcome()
-                try:
-                    snap = fetch_usage(creds.access_token)
-                except urllib.error.HTTPError as e2:
-                    return self._handle_api_http_error(e2)
-                except urllib.error.URLError:
-                    raise
-                except Exception:
-                    raise
-            else:
-                return self._handle_api_http_error(e)
-
-        # Success path
-        with self._lock:
-            self.state.usage = snap
-            self.state.usage_error = ""
-            self.state.token_expired = False
-            self.state.last_api_fetch = time.time()
-        self._save_usage_cache(snap)
-        self._check_thresholds(snap)
-        self._on_change()
+                self._mark_token_expired("token_rejected")
+                return self._OUT_TOKEN_EXPIRED
+            return self._handle_api_http_error(e)
+        self._publish(snap, SOURCE_API)
         return self._OUT_OK
 
-    def _refresh_outcome(self) -> str:
-        """Map a failed _try_refresh into a scheduler outcome."""
-        if self._refresh_cooldown_left > 0:
-            return self._OUT_COOLDOWN
-        if self.state.api_backoff_until > time.time():
-            return self._OUT_BACKOFF
-        return self._OUT_RETRYABLE
-
-    def _try_refresh(self) -> OAuthCreds | None:
-        """Attempt OAuth refresh-and-save with rate-limiting."""
-        now = time.time()
-        cooldown_left = MIN_REFRESH_INTERVAL_SEC - (
-            now - self.state.last_refresh_attempt
-        )
-        if cooldown_left > 0:
-            self._refresh_cooldown_left = cooldown_left
-            self._record_api_error(
-                f"Token expired, refresh on cooldown ({int(cooldown_left)}s)",
-                auth_stale=True,
-            )
-            return None
-
+    def _mark_token_expired(self, code: str) -> None:
         with self._lock:
-            self.state.last_refresh_attempt = now
-
-        try:
-            new_creds = refresh_and_save()
-        except urllib.error.HTTPError as e:
-            body = ""
-            try:
-                body = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                pass
-            if e.code == 400 and "invalid_grant" in body:
-                # A concurrent Claude Code refresh may have consumed the token
-                # first and already written fresh credentials. Prefer the disk if
-                # it is now valid; otherwise back off and ask for re-login.
-                try:
-                    fresh = load_oauth_creds()
-                    if not fresh.is_expired():
-                        log.info("refresh token already rotated on disk; using it")
-                        with self._lock:
-                            self.state.token_expired = False
-                            self.state.usage_error = ""
-                        return fresh
-                except Exception:
-                    pass
-                with self._lock:
-                    self.state.api_backoff_until = (
-                        time.time() + INVALID_GRANT_BACKOFF_SEC
-                    )
-                self._record_api_error(
-                    "Refresh rejected - open Claude Code and run /login",
-                    auth_stale=True,
-                )
-            else:
-                self._record_api_error(
-                    f"Refresh HTTP {e.code}: {body[:80]}",
-                    auth_stale=True,
-                )
-            return None
-        except urllib.error.URLError as e:
-            self._record_api_error(
-                f"Refresh network: {e.reason}",
-                auth_stale=True,
-            )
-            return None
-        except Exception as e:  # noqa: BLE001
-            self._record_api_error(
-                f"Refresh failed: {type(e).__name__}: {e}",
-                auth_stale=True,
-            )
-            return None
-
-        if new_creds.is_expired():
-            self._record_api_error(
-                "Refresh did not produce a valid access token",
-                auth_stale=True,
-            )
-            return None
-
-        with self._lock:
-            self.state.token_expired = False
-            self.state.usage_error = ""
-        log.info(
-            "OAuth token refreshed; new expiry %s",
-            time.strftime("%H:%M:%S", time.localtime(new_creds.expires_at_unix)),
-        )
-        return new_creds
+            first = not self.state.token_expired
+            self.state.token_expired = True
+            self.state.usage_error = code
+        if first:
+            log.info("access token %s; waiting for Claude Code to rotate it "
+                     "(read-only: this app never refreshes tokens)", code)
+            self._on_change()
 
     def _handle_api_http_error(self, e: urllib.error.HTTPError) -> str:
-        """Record a usage-endpoint HTTP error, set backoff if appropriate, and
-        return the outcome code for _api_loop's wait selection."""
         msg = f"HTTP {e.code}: {e.reason}"
         if e.code == 429:
             with self._lock:
@@ -409,8 +394,14 @@ class Orchestrator:
             self._record_api_error(msg)
             return self._OUT_BACKOFF
         self._record_api_error(msg)
-        # Non-429 HTTP error: ladder only while we still have nothing to show.
         return self._OUT_RETRYABLE if self.state.usage is None else self._OUT_OK
+
+    def _record_api_error(self, msg: str) -> None:
+        with self._lock:
+            self.state.usage_error = msg
+        log.warning("usage api fetch failed: %s", msg)
+
+    # ---------- local JSONL costs ----------
 
     def _jsonl_loop(self) -> None:
         while not self._stop.is_set():
@@ -427,15 +418,6 @@ class Orchestrator:
                 log.warning("jsonl parse failed: %s", e)
             self._jsonl_wake.wait(timeout=JSONL_INTERVAL_SEC)
             self._jsonl_wake.clear()
-
-    def _record_api_error(self, msg: str, *, auth_stale: bool = False) -> None:
-        with self._lock:
-            self.state.usage_error = msg
-            if auth_stale:
-                self.state.token_expired = True
-        log.warning("usage api fetch failed: %s", msg)
-        if auth_stale:
-            self._on_change()
 
     def _check_thresholds(self, snap: UsageSnapshot) -> None:
         """Fire alert callbacks when crossing a threshold for the first time per window.
