@@ -22,3 +22,9 @@ cc-usage-tray.log.*
 # OS junk
 Thumbs.db
 .DS_Store
+
+# PyInstaller output
+build/
+dist/
+# Atomic-write temp files
+*.json.*.tmp

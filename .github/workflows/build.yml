@@ -1,0 +1,61 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to attach the zip to a GitHub Release on tags
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller==6.11.1
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build (PyInstaller, one-folder)
+        run: pyinstaller --noconfirm ClaudeUsageMonitor.spec
+
+      - name: Smoke-test the statusLine helper exe
+        shell: pwsh
+        run: |
+          $payload = '{"model":{"display_name":"Opus"},"rate_limits":{"five_hour":{"used_percentage":33,"resets_at":1767225600},"seven_day":{"used_percentage":91,"resets_at":1767600000}}}'
+          $out = $payload | & .\dist\ClaudeUsageMonitor\cc-usage-statusline.exe
+          Write-Host "helper output: $out"
+          if ($LASTEXITCODE -ne 0) { throw "helper exited $LASTEXITCODE" }
+          if (-not ($out -match '5h 33%')) { throw "unexpected helper output: $out" }
+          $cap = Join-Path $env:USERPROFILE '.claude\usage-monitor\statusline.json'
+          if (-not (Test-Path $cap)) { throw "capture file not written: $cap" }
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          Copy-Item README.md, README.zh.md, LICENSE dist\ClaudeUsageMonitor\
+          Compress-Archive -Path dist\ClaudeUsageMonitor -DestinationPath ClaudeUsageMonitor-win64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeUsageMonitor-win64
+          path: ClaudeUsageMonitor-win64.zip
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ClaudeUsageMonitor-win64.zip
+          generate_release_notes: true

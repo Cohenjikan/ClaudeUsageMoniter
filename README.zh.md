@@ -2,7 +2,7 @@
 
 # ClaudeUsageMonitor
 
-### 一款超轻量的 Windows 托盘应用，实时显示你的 Claude Code Pro/Max 真实配额——直接复用 Claude Code 自身的登录态，让你永远无需二次登录。
+### 一款超轻量的 Windows 托盘应用，实时显示你的 Claude Code Pro/Max 真实配额——数据直接来自 Claude Code 自己的状态栏，无需登录，也不碰任何 token。
 
 **[English](README.md)** · **中文**
 
@@ -33,9 +33,9 @@
 
 你每天大量使用 Claude Code，却总是撞上 5 小时上限或每周封顶——而且往往是*等到 Claude 提示你时才知道*。现有的监控工具要么界面像坏掉的电子表格，要么每隔几小时就逼你重新过一遍浏览器登录，要么只统计本地日志、从不显示真实的服务端配额。
 
-**ClaudeUsageMonitor 把权威数字钉在你的任务栏上，又绝不碍事。** 它读取 Claude Code 已经写到磁盘上的同一份 OAuth 令牌，调用 Anthropic 官方的用量接口，准确告诉你离上限还有多远——在你触顶之前。
+**ClaudeUsageMonitor 把权威数字钉在你的任务栏上，又绝不碍事。** Claude Code 本来就知道你的 5 小时和每周用量，并会把它传给状态栏命令；本应用把这份数据接过来，准确告诉你离上限还有多远——在你触顶之前。
 
-> **诀窍所在：** 它复用 Claude Code 位于 `~/.claude/.credentials.json` 的本地 OAuth 状态，并在 access token 过期时安全刷新写回。本应用**没有任何登录界面**——装好即用。
+> **诀窍所在：** 从 v2.1.80 起，Claude Code 会把 `rate_limits` 数据通过 stdin 传给你的[状态栏](https://code.claude.com/docs/en/statusline)命令。一个很小的桥接脚本把它存到本地文件，托盘程序监听这个文件。**不读取、不刷新、不发送任何 token，也没有网络请求**——所以也没有限流。Claude Code 空闲时，可选的**只读** API 调用负责补位。
 
 ---
 
@@ -43,17 +43,21 @@
 
 收益在前，机制在后。以下每一项都对应着本仓库中真实的代码。
 
-### 零额外登录（OAuth 借用）
-装好即用，直接复用你已有的 Claude Code 会话。永远无需登录任何东西。
-> `usage_api.py` 读取 `~/.claude/.credentials.json`，并在**每一次**调用时都从磁盘重新读取（`load_oauth_creds`，第 89–112 行），因此能自动接住 Claude Code 自己轮换出的新令牌。整个代码库中不存在任何登录 UI。
+### 无需 token 的实时配额（来自 Claude Code 状态栏）
+每次 Claude Code 刷新状态栏，你的 5 小时与每周数字就跟着更新——没有轮询间隔，不用登录，不碰 token。
+> `statusline_bridge.py` 注册为 Claude Code 的 `statusLine` 命令（**设置 → 常规**里勾选一下即可）。它只把数据里的 `rate_limits`（外加模型名）存到 `~/.claude/usage-monitor/statusline.json`，并输出一行状态栏文字。如果你原本就有状态栏，桥接脚本会**串联**执行它——你原来的命令照常运行，显示的也还是它的输出。`Orchestrator.poll_statusline`（`state.py`）每 2 秒检查一次该文件，有新数据立即发布。
 
 ### 真实服务端配额，而非估算
 5 小时与每周百分比就是 *Claude Code 所使用的同一份权威数字*，并且涵盖你**全部**订阅用量——Code **加上** chat/desktop/web——而不是从本地日志猜出来的。
-> `fetch_usage`（`usage_api.py:189`）向 `https://api.anthropic.com/api/oauth/usage` 发起 GET 请求，直接从响应中读取 `five_hour.utilization` / `seven_day.utilization`。该接口未公开文档；`User-Agent` 必须是 `claude-code/2.0.0`，否则会被归入更严格的限流桶。
+> 两个数据源携带的都是 Anthropic 自己的用量数字。它们被统一转换成同一种结构（`statusline.body_from_capture` → `usage_api.snapshot_from_body`），因此界面、提醒和缓存对两者一视同仁。
 
-### 自动续期鉴权——不再每 8 小时唤醒终端
-`~/.claude/.credentials.json` 里的 `refresh_token` 与 Claude Code 共用，并且每次刷新都会轮换，因此本应用会谨慎处理：先读取当前磁盘状态，只在 access token 过期或被服务端拒绝时刷新，并把新的 access/refresh token 原子写回同一个文件。
-> `_do_fetch_cycle`（`state.py`）在需要时调用 `refresh_and_save`，401 后只重试一次，并在 `invalid_grant` 或限流时退避。`save_oauth_creds`（`usage_api.py`）写入前会确认磁盘上的 `refreshToken` 仍是本次使用的那一个，因此不会覆盖 Claude Code 刚刚写入的新登录/刷新状态。
+### Claude Code 空闲时的只读后备
+没有 Claude Code 会话在运行时（比如一下午只用 chat），配额仍然可以保持更新。
+> `fetch_usage`（`usage_api.py`）用 Claude Code 当前磁盘上的 access token，向未公开文档的 `https://api.anthropic.com/api/oauth/usage` 发起 GET。只有状态栏空闲时才每 6 分钟调用一次；状态栏活跃时降到每 30 分钟一次（仅为获取分模型配额）；也可以在**设置 → 常规**里完全关闭。
+
+### 绝不碰你的登录状态
+本应用**从不刷新、也从不写入你的 OAuth 令牌**。`~/.claude/.credentials.json` 里的 `refresh_token` 与 Claude Code 共用，且每用一次就轮换；由第二个程序去刷新，可能与 Claude Code 抢写导致你被登出，而且等于冒充 Claude Code 的 OAuth 客户端。
+> `usage_api.py` 中完全没有刷新或写入代码（有单元测试保证）。磁盘上的 access token 过期或被拒时，API 后备只会等待——每 45 秒重新读一次文件，不发网络请求——Claude Code 一轮换令牌就自动恢复。开启状态栏数据源后，token 过期本身就无关紧要。
 
 ### 始终可见的任务栏条
 一条极小的无边框读数条直接停靠在 Windows 任务栏上，无需打开任何窗口即可一瞥配额。
@@ -65,6 +69,8 @@
 ### 稳压 Win11 外壳之上
 任务栏条不会被最大化窗口、任务栏或开机时的自启动竞争所遮挡。
 > `app.py` 中有三道防线：每周期的置顶补偿（`_force_topmost`）、直接的 `SetWindowPos(HWND_TOPMOST)` 兜底（`_force_topmost_winapi`），以及基于 `WindowFromPoint` 的多点遮挡检测（`_is_covered`）——外加一段从 300 毫秒持续到 10 秒的启动置顶补偿连击。
+>
+> **实验性：嵌入任务栏内部。** **设置 → 状态条 → 嵌入任务栏内部**会把状态条变成任务栏（`Shell_TrayWnd`）的子窗口，也就是 TrafficMonitor 在 Win11 上的做法。任务栏的子窗口作为任务栏的一部分绘制，任何窗口都盖不住它，上面那套置顶机制也完全不用运行。它依赖未公开的系统外壳细节，所以默认关闭；嵌入失败时（外壳还没启动、被安全软件拦截）状态条保持置顶模式并每约 5 秒重试，`explorer.exe` 重启后也会自动恢复（`TaskbarStrip._try_embed` / `_embed_healthy`）。嵌入状态下不能拖动。
 
 ### 拖拽定位，位置持久化
 把它放到你喜欢的任何位置；重启后依旧停在那里。
@@ -100,7 +106,7 @@ Anthropic 现在会对部分模型在总周配额之外单独计量。每个这�
 
 ### 双语界面与真正的设置窗口
 在中英文之间切换、开关开机自启、选择状态条靠边／不透明度／显示模式——全都在同一个**托盘 → 设置**窗口里完成（常规／状态条／关于），不再是层层嵌套的托盘子菜单。
-> `LANGUAGES` 保存 `en` 与 `zh` 两套字典，驱动每一处可见文案；`SettingsWindow`（`app.py`）是一个深色主题的 `Toplevel`，配有自绘的分段式标签栏。它提供语言选择器、**开机自启**复选框、状态条靠边（左／右）、不透明背景，以及四种显示模式（紧凑 / +剩余时间 / +剩余时间% / +已用时间%）。所有更改即时生效并持久化到 `config.json`。
+> `LANGUAGES` 保存 `en` 与 `zh` 两套字典，驱动每一处可见文案；`SettingsWindow`（`app.py`）是一个深色主题的 `Toplevel`，配有自绘的分段式标签栏。它提供语言选择器、**开机自启**复选框、配额数据来源开关（状态栏 / 只读 API 后备）及实时状态提示、状态条靠边（左／右）、不透明背景、嵌入任务栏，以及四种显示模式（紧凑 / +剩余时间 / +剩余时间% / +已用时间%）。所有更改即时生效并持久化到 `config.json`。
 
 ### 秒开，且绝不会无声卡死
 窗口一打开就显示你最近一次已知的配额——哪怕首次网络请求还没回来——而且全程只会运行一个实例。万一数据管线停摆（令牌过期、断网），配额会被置灰并标上**「数据旧」**及其时长，让它读起来是*旧数据*，而不是一个卡死的程序。
@@ -110,65 +116,58 @@ Anthropic 现在会对部分模型在总周配额之外单独计量。每个这�
 
 ## 快速上手
 
-**前置条件：** Windows 10/11 · Python 3.11+ · Claude Code **已登录**（即 `~/.claude/.credentials.json` 已存在）。
+**前置条件：** Windows 10/11 · 已安装 Claude Code 并用 Pro/Max 账号登录。
+
+### 方式 A：下载 exe（不需要 Python）
+
+1. 从[最新 Release](https://github.com/Cohenjikan/ClaudeUsageMoniter/releases/latest) 下载 `ClaudeUsageMonitor-win64.zip`，解压到任意有写权限的目录（例如 `D:\Apps\ClaudeUsageMonitor`）。设置和缓存都保存在 exe 旁边。
+2. 运行 `ClaudeUsageMonitor.exe`。
+
+### 方式 B：从源码运行（Python 3.11+）
 
 ```powershell
-# 1. 克隆
 git clone https://github.com/Cohenjikan/ClaudeUsageMoniter D:\Apps\cc-usage-tray
 cd D:\Apps\cc-usage-tray
-
-# 2. 安装依赖（tkinter 随 Python 一同提供）
-pip install pystray Pillow winotify
-
-# 3. 运行——使用 pythonw（无控制台窗口）
-pythonw.exe app.py
+pip install -r requirements.txt     # tkinter 随 Python 一同提供
+pythonw.exe app.py                  # pythonw = 无控制台窗口
 ```
 
-就这样。托盘图标会出现并显示实时的 5h%，任务栏条也会钉到你的任务栏上。**没有登录提示——它复用你已有的 Claude Code 会话。**
+### 开启状态栏数据源（推荐）
+
+打开**托盘 → 设置 → 常规**，勾选 **Claude Code 状态栏**。这会在 `~/.claude/settings.json` 里添加一条 `statusLine`（原文件备份为 `settings.json.bak-usage-monitor`；你原有的状态栏会通过桥接照常显示）。取消勾选即恢复原来的状态栏。复选框下方的状态提示会显示当前是否有 Claude Code 会话在提供实时数据。
+
+不开启也能用，只是只剩只读 API 后备这一个数据源。
 
 ### 可选：开机自启动
 
-最简单的方式：打开**托盘 → 设置 → 常规**，勾选**开机自启**。它会帮你创建（并删除）启动文件夹中的快捷方式，并使用 `pythonw.exe` 以避免开机时弹出控制台窗口。如果本应用的自启动启动器已存在，该复选框会自动识别并反映其状态。
-
-手动方式（备选）——在启动文件夹（`Win+R` → `shell:startup`）中创建一个快捷方式，指向：
-
-```
-目标：      "<python_install>\pythonw.exe" "D:\Apps\cc-usage-tray\app.py"
-起始位置：  D:\Apps\cc-usage-tray
-```
-
-请使用 `pythonw.exe`（而非 `python.exe`），以避免开机时一闪而过的控制台窗口。
+打开**托盘 → 设置 → 常规**，勾选**开机自启**。它会在启动文件夹中创建（或删除）指向 exe 的快捷方式；从源码运行时则通过 `pythonw.exe` 启动 `app.py`。
 
 ---
 
-## 认证机制如何运作
+## 配额数据从哪里来
 
-有意思（且未公开文档）的部分在于：Anthropic 暴露了 `https://api.anthropic.com/api/oauth/usage` 接口，它返回的正是 Claude Code 自身所用的同一份权威 5h / 每周用量。我们借用 Claude Code 位于 `~/.claude/.credentials.json` 的本地 OAuth 令牌（无需单独登录），并以如下方式调用该接口：
-
-```http
-Authorization: Bearer <accessToken from credentials>
-anthropic-beta: oauth-2025-04-20
-User-Agent: claude-code/2.0.0     # 必需——缺少它将被打入严格的限流桶
-```
-
-响应（结构示意——数值仅供示例）：
+**主数据源：Claude Code 状态栏。** Claude Code 每次刷新状态栏都会运行你的 `statusLine` 命令，并通过 stdin 传入一段 JSON。Pro/Max 账号的数据里包含：
 
 ```json
-{
-  "five_hour": {"utilization": 33.0, "resets_at": "2026-05-26T00:50:00+00:00"},
-  "seven_day": {"utilization": 91.0, "resets_at": "2026-05-26T00:59:59+00:00"}
+"rate_limits": {
+  "five_hour": {"used_percentage": 33, "resets_at": 1767225600},
+  "seven_day": {"used_percentage": 91, "resets_at": 1767600000}
 }
 ```
 
-该接口的限流约为每令牌 5 次请求，因此我们每 **6 分钟**轮询一次。本地 JSONL 花费视图刷新更快，每 **30 秒**一次。
+`statusline_bridge.py`（Release 压缩包里是 `cc-usage-statusline.exe`）把这段数据写入 `~/.claude/usage-monitor/statusline.json` 并输出一行状态栏文字。托盘程序约 2 秒内就能拿到变化。
+
+**后备：只读调用用量接口。** 状态栏空闲时，程序用 Claude Code 当前的 access token 调用未公开文档的 `https://api.anthropic.com/api/oauth/usage`（带 `anthropic-beta: oauth-2025-04-20` 和 `User-Agent: claude-code/2.0.0`，缺少后者会被归入更严格的限流桶）。它从不刷新 token。该接口每个 token 只允许约 5 次请求，所以每 6 分钟轮询一次；状态栏活跃时放慢到每 30 分钟。
+
+**本地花费。** 每 30 秒解析一次 `~/.claude/projects/**/*.jsonl`。
 
 ```mermaid
 flowchart LR
-    A[Claude Code<br/>writes + rotates token] -->|~/.claude/.credentials.json| B[usage_api.py<br/>load_oauth_creds · refresh_and_save]
-    B -->|Bearer token<br/>UA: claude-code/2.0.0| C[/api/oauth/usage<br/>poll 6 min/]
-    B -.->|expired/401?<br/>refresh + atomic save| B
-    C --> D[state.py<br/>Orchestrator]
-    E[~/.claude/projects/**.jsonl] -->|parse 30 s| F[jsonl_costs.py<br/>build_report]
+    CC[Claude Code session] -->|statusLine stdin JSON<br/>rate_limits| BR[statusline_bridge.py]
+    BR -->|~/.claude/usage-monitor/statusline.json| D[state.py<br/>Orchestrator]
+    CR[~/.claude/.credentials.json<br/>read-only] -.->|only while status line idle| API[/api/oauth/usage<br/>≤ every 6 min/]
+    API -.-> D
+    E[~/.claude/projects/**.jsonl] -->|parse 30 s| F[jsonl_costs.py]
     F --> D
     D --> G[Tray icon · Taskbar strip · Floating window]
 ```
@@ -184,9 +183,9 @@ flowchart LR
 | [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) | 借用 Claude Code OAuth | 像素化的彩色方块 | 界面丑 |
 | [SlavomirDurej/claude-usage-widget](https://github.com/SlavomirDurej/claude-usage-widget) | Claude.ai 网页会话 | Electron 小部件 | 周期性的浏览器重新登录 |
 | [ryoppippi/ccusage](https://github.com/ryoppippi/ccusage) | 仅本地 JSONL | CLI / statusline | 无 GUI · 无真实服务端配额 |
-| **ClaudeUsageMonitor** | **OAuth 借用** | **托盘 + 任务栏条 + 窗口** | **仅限 Windows** |
+| **ClaudeUsageMonitor** | **Claude Code 状态栏**（+ 只读 OAuth 后备） | **托盘 + 任务栏条 + 窗口** | **仅限 Windows** |
 
-本项目从这三者中各取所长：**OAuth 借用式认证**（零重新登录）+ **干净的 tkinter 界面** + **真实的服务端配额 %** + 来自本地 JSONL 的**按项目花费**。它嵌在 Win11 任务栏区域内，配以三重置顶防御，使最大化窗口在结构上无法将其遮挡——这正是大多数悬浮小部件忽视的问题。
+本项目从这三者中各取所长：**零登录**（状态栏优先，只读 OAuth 后备）+ **干净的 tkinter 界面** + **真实的服务端配额 %** + 来自本地 JSONL 的**按项目花费**。它嵌在 Win11 任务栏区域内，配以三重置顶防御，使最大化窗口在结构上无法将其遮挡——这正是大多数悬浮小部件忽视的问题。
 
 ---
 
@@ -196,26 +195,32 @@ flowchart LR
 
 - **`$` 金额仅涵盖 Claude Code（CLI）。** 今日／会话／本月／按项目的美元数**纯粹**来自本地 `~/.claude/projects` 的会话记录。Claude **桌面应用与网页 chat 不会写入任何本地 token 计数**，因此在只用 chat 的日子里，**「今日 $」会停留在 $0.00**。 5h/7d 的**百分比**进度条则不同——它们来自服务端，**确实**把 chat 与 code 一并计入。如果你两者混用，这才是该盯紧的数字。
 - **等效 API $ 仅供对比，不用于计费。** 你支付的是固定的 Pro/Max 订阅费。这些美元估算的是同样的 token 在按量付费 API 上会花多少钱——用于给项目价值排序很有用，但不对应你的账单。
-- **服务端配额最多每 6 分钟更新一次。** `/api/oauth/usage` 接口限流相当严格（约每令牌 5 次请求），因此百分比可能比实时用量滞后几分钟。本地 JSONL 花费每 30 秒刷新一次。
+- **实时更新需要有 Claude Code 会话在运行。** 状态栏数据源只在 Claude Code 打开并刷新状态栏时更新。其余时间由只读 API 后备最多每 6 分钟更新一次（该接口限流严格）；如果你关闭了后备，配额会在 15 分钟后标记为「数据旧」。本地 JSONL 花费每 30 秒刷新一次。
 - **任务栏条默认显示在主显示器上。** 拖动后的位置可能落到副显示器上；**重置任务栏条位置**会让它回到主显示器。
 - **独占全屏的游戏／应用会渲染在用户空间一切之上**，因此当某个这样的程序在前台时任务栏条会被遮住。请改用无边框窗口模式以保持其可见。
 - **仅限 Windows 10/11。** 尽管凭据路径在 macOS/Linux 上同样存在，整套 UI 都是 Windows 专属的（ctypes/user32、任务栏钉附、`winotify` 通知，以及一处用于通知投递的 PowerShell 路径修复）。它**不是**跨平台的。
-- **需要已有的 Claude Code 登录。** 本应用自身没有任何登录功能；它依赖 `~/.claude/.credentials.json` 事先就在那里。
-- **刷新失败时，配额只会「变旧」，绝不会变错。** 本应用现在会自己刷新共用 OAuth 令牌，因此正常的 ~8 小时 access-token 过期不再需要终端里的 Claude Code 会话来唤醒。如果刷新被拒绝、被限流或网络不可用，配额会被清楚地**置灰并标上「数据旧」及其时长**，直到下一次成功拉取。
-- **它依赖一个未公开文档的接口和一个伪造的 User-Agent。** 这并非 Anthropic 官方或受支持的集成——Anthropic 随时可能更改 `/api/oauth/usage` 接口或对 `claude-code/2.0.0` UA 的预期，从而让配额读数失效。
+- **需要 Pro/Max 账号的 Claude Code。** 本应用自身没有任何登录功能。API key 账号的状态栏数据里没有 `rate_limits`，也没有订阅配额可显示。
+- **配额只会「变旧」，绝不会变错。** 如果所有数据源都拿不到新数据（Claude Code 空闲且 access token 已过期、断网、关闭了后备），配额会被清楚地**置灰并标上「数据旧」及其时长**。本应用从不自己刷新 token；打开 Claude Code 让它轮换令牌，配额就会自动恢复。
+- **后备数据源使用未公开的接口和 Claude Code 的 User-Agent。** 这部分不是 Anthropic 官方或受支持的集成，随时可能失效。Anthropic 的条款限制在第三方工具中使用订阅 OAuth 令牌；本应用只读取用量数字、从不发送推理请求，但如果你完全不想碰 token，可以取消勾选**后备：只读调用用量 API**，只依赖状态栏。
+- **嵌入任务栏是实验性功能。** 它依赖未公开的 Windows 外壳细节，在部分 Windows 版本上可能表现异常，默认关闭。
 
 ---
 
 ## 架构
 
 ```
-usage_api.py     OAuth 令牌加载/刷新器 + /api/oauth/usage HTTP 客户端。
-jsonl_costs.py   JSONL 解析器 + 花费聚合器（内联的两档缓存定价表）。
-state.py         两个守护线程：API 轮询（6 分钟）与 JSONL 解析（30 秒）。
-                 自动刷新过期/被拒绝的 OAuth 令牌；鉴权或限流失败时退避。
-                 阈值越线告警每个窗口每次越线触发一次。
-app.py           入口点：tkinter FloatingWindow + pystray 托盘图标 + TaskbarStrip。
-                 任务栏条采用三重置顶防御，稳压 Win11 外壳之上。
+statusline_bridge.py  Claude Code 的 statusLine 命令：保存 rate_limits，串联执行
+                      原有状态栏，永远以 0 退出。
+statusline.py         数据格式、转换为用量接口结构，以及在
+                      ~/.claude/settings.json 中安装/卸载桥接。
+usage_api.py          只读的 OAuth 令牌读取 + /api/oauth/usage 客户端。
+jsonl_costs.py        JSONL 解析器 + 花费聚合器（两档缓存定价）。
+state.py              Orchestrator：状态栏文件监听（2 秒）、节流的只读 API 后备、
+                      JSONL 解析（30 秒）、阈值提醒、缓存。
+paths.py              运行时文件位置（app.py 或 exe 所在目录）。
+app.py                入口：tkinter FloatingWindow + pystray 托盘图标 +
+                      TaskbarStrip（置顶模式或实验性的任务栏嵌入）。
+ClaudeUsageMonitor.spec  PyInstaller 单目录构建（托盘 exe + 状态栏辅助 exe）。
 ```
 
 ---
@@ -232,7 +237,7 @@ STRIP_SIDE_MARGIN = 12            # 与所选边缘的间距
 STRIP_GAP_FROM_TASKBAR = 0        # 任务栏条底部与任务栏顶部之间的间距
 ```
 
-按用户区分的状态（状态条位置、靠边、显示模式、不透明背景开关，以及语言）保存在脚本同目录的 `config.json` 中——通过拖动以及**托盘 → 设置**来设置。该文件按用户区分且被 git 忽略，因此全新克隆出来时并不存在，直到你创建它；删除它，或使用**重置位置**（设置 → 状态条），即可复位到默认值。
+按用户区分的状态（状态条位置、靠边、显示模式、不透明背景和嵌入开关、语言，以及 `quota.api_fallback` 开关）保存在 `app.py`（或 exe）同目录的 `config.json` 中——通过拖动以及**托盘 → 设置**来设置。该文件按用户区分且被 git 忽略，因此全新克隆出来时并不存在，直到你创建它；删除它，或使用**重置位置**（设置 → 状态条），即可复位到默认值。
 
 定价表位于 `jsonl_costs.py:PRICING`——当 Anthropic 调整费率或推出新的模型系列时，请更新它。
 
@@ -243,9 +248,20 @@ STRIP_GAP_FROM_TASKBAR = 0        # 任务栏条底部与任务栏顶部之间�
 | | |
 |---|---|
 | **操作系统** | Windows 10 或 11 |
-| **Python** | 3.11+ |
-| **依赖** | `pystray`、`Pillow`、`winotify`（tkinter 随 Python 一同提供） |
-| **前置条件** | 已安装并登录 Claude Code（`~/.claude/.credentials.json` 必须存在） |
+| **Python** | 使用 Release 的 exe 不需要；从源码运行需 3.11+ |
+| **依赖** | `pystray`、`Pillow`、`winotify`（tkinter 随 Python 一同提供），见 `requirements.txt` |
+| **前置条件** | 已安装 Claude Code 并用 Pro/Max 账号登录（状态栏数据源需 v2.1.80+） |
+
+---
+
+## 开发
+
+```powershell
+python -m unittest discover -s tests   # 只用标准库，Linux/macOS 上也能跑
+.\build.ps1                            # 测试 + PyInstaller 构建到 dist\ClaudeUsageMonitor\
+```
+
+CI（`.github/workflows/build.yml`）会在 Windows 上跑测试、构建单目录包、对状态栏辅助 exe 做冒烟测试；推送 `v*` 标签时把 `ClaudeUsageMonitor-win64.zip` 附加到 GitHub Release。
 
 ---
 
