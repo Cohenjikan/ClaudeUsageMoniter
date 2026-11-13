@@ -33,6 +33,9 @@ from winotify import Notification, audio
 from jsonl_costs import Aggregate
 from state import Orchestrator
 from usage_api import UsageSnapshot
+import queue
+import strip_render
+from taskbar_widget import NativeTaskbarWidget, taskbar_is_light
 
 __version__ = "0.4.0"
 
@@ -105,6 +108,13 @@ LANGUAGES: dict[str, dict[str, str]] = {
         "strip_drag_on": "Drag mode: ON (drag the strip)",
         "strip_drag_off": "Drag mode: OFF",
         "strip_reset_pos": "Reset position",
+        "strip_style": "Style",
+        "style_bars": "Progress bars",
+        "style_rings": "Rings",
+        "style_classic": "Classic text",
+        "classic_only": "Classic style only:",
+        "resets_in_short": "resets in {left}",
+        "idle_short": "idle",
         "about_blurb": (
             "5h / 7d % are server-side and include ALL usage — chat plus code.\n\n"
             "$ values come only from local Claude Code transcripts: an equivalent "
@@ -177,6 +187,13 @@ LANGUAGES: dict[str, dict[str, str]] = {
         "strip_drag_on": "拖动模式：开（拖动状态条）",
         "strip_drag_off": "拖动模式：关",
         "strip_reset_pos": "重置位置",
+        "strip_style": "样式",
+        "style_bars": "进度条",
+        "style_rings": "圆环",
+        "style_classic": "经典文字",
+        "classic_only": "仅经典样式有效：",
+        "resets_in_short": "{left}后重置",
+        "idle_short": "空闲",
         "about_blurb": (
             "5h / 7d 百分比来自服务端，涵盖全部用量——chat 加 code。\n\n"
             "$ 金额仅来自本地 Claude Code 会话记录：等效 API 价值，不含 chat。\n\n"
@@ -269,6 +286,11 @@ TEXT_OUTLINE = "#000000"
 STRIP_W, STRIP_H = 360, 26
 STRIP_SIDE = "left"         # "left" or "right" — which side of the screen to pin to
 STRIP_SIDE_MARGIN = 12      # gap from the chosen screen edge
+# Strip look. "bars"/"rings" are drawn by strip_render into a native, DPI-aware,
+# taskbar-owned layered window (taskbar_widget.py). "classic" is the original
+# outlined-text tkinter strip, kept for anyone who prefers it.
+STRIP_STYLES = ("bars", "rings", "classic")
+STRIP_STYLE_DEFAULT = "bars"
 # The strip pins ON the Windows taskbar by default (get_strip_default_y centers
 # it in the taskbar band). This placement is deliberate and load-bearing:
 # maximized windows fill only the work area (which ends at the taskbar's top
@@ -910,7 +932,11 @@ class FloatingWindow:
         quota = self._card(pad)
         self.quota_widgets: dict[str, tuple] = {}
         for key, label_key in (("5h", "lbl_5h_window"), ("7d", "lbl_weekly")):
-            row = tk.Frame(quota, bg=PANEL)
+            # Each main quota row lives in its own frame so the 5h row can be
+            # hidden on plans without a 5h limit (Ultra) and re-shown in place.
+            holder = tk.Frame(quota, bg=PANEL)
+            holder.pack(fill="x")
+            row = tk.Frame(holder, bg=PANEL)
             row.pack(fill="x", padx=12, pady=(10, 0))
             lbl = tk.Label(row, text=t(label_key), bg=PANEL, fg=FG_DIM,
                            font=("Segoe UI", 9), anchor="w")
@@ -918,15 +944,16 @@ class FloatingWindow:
             pct_lbl = tk.Label(row, text="—", bg=PANEL, fg=FG,
                                font=("Segoe UI Semibold", 16), anchor="e")
             pct_lbl.pack(side="right")
-            bar_canvas = tk.Canvas(quota, height=6, bg=PANEL,
+            bar_canvas = tk.Canvas(holder, height=6, bg=PANEL,
                                    highlightthickness=0, bd=0)
             bar_canvas.pack(fill="x", padx=12, pady=(3, 0))
-            caption = tk.Label(quota, text="", bg=PANEL, fg=FG_DIM,
+            caption = tk.Label(holder, text="", bg=PANEL, fg=FG_DIM,
                                font=("Segoe UI", 8), anchor="w")
             caption.pack(fill="x", padx=12, pady=(2, 8))
             # The label is pre-created and updated in _render so a language
             # switch reflects on the next tick.
             self.quota_widgets[key] = {
+                "holder": holder, "shown": True,
                 "label": lbl, "label_key": label_key,
                 "pct": pct_lbl, "bar": bar_canvas, "caption": caption,
             }
@@ -1128,6 +1155,18 @@ class FloatingWindow:
                     lambda: u.seven_day_active, lambda: u.seven_day_reset)),
         ):
             w = self.quota_widgets[key]
+            if key == "5h":
+                # Plans without a 5h limit (Ultra): hide the row entirely.
+                want = u is None or u.has_five_hour
+                if want != w["shown"]:
+                    w["shown"] = want
+                    if want:
+                        w["holder"].pack(fill="x",
+                                         before=self.quota_widgets["7d"]["holder"])
+                    else:
+                        w["holder"].pack_forget()
+                if not want:
+                    continue
             w["label"].config(text=t(w["label_key"]))  # i18n refresh
             if u is None:
                 w["pct"].config(text="—", fg=FG_DIM)
@@ -1300,6 +1339,11 @@ class TaskbarStrip:
         # Configurable via Settings → Strip; defaults to the module-level STRIP_SIDE.
         raw_side = cfg.get("side", STRIP_SIDE)
         self.side = raw_side if raw_side in ("left", "right") else STRIP_SIDE
+        raw_style = cfg.get("style", STRIP_STYLE_DEFAULT)
+        self.style = raw_style if raw_style in STRIP_STYLES else STRIP_STYLE_DEFAULT
+        self._native: NativeTaskbarWidget | None = None
+        self._native_hover = False
+        self.win = None  # classic-style Toplevel; None in the modern styles
 
         # Font instances (not just tuples) so we can call .measure() during
         # layout. They're interpreter-level and survive a window teardown, so
@@ -1310,14 +1354,172 @@ class TaskbarStrip:
         # Keep the parent so the tick loop can REBUILD the strip window if an
         # external event destroys it out from under us (see _create_window).
         self._parent_root = parent_root
-        self._create_window()
-        # Validate saved drag position before first paint: only catches *truly
-        # off-screen* positions (a now-disconnected monitor, or a shrunk
-        # resolution). Taskbar overlap is fine — _is_covered() + the topmost
-        # burst handle z-order contention.
-        self._validate_custom_pos()
-        self._reposition()
+        self._render_sig = None
+        if self._classic:
+            self._create_window()
+            # Validate saved drag position before first paint: only catches
+            # *truly off-screen* positions (a now-disconnected monitor, or a
+            # shrunk resolution). Taskbar overlap is fine — _is_covered() + the
+            # topmost burst handle z-order contention.
+            self._validate_custom_pos()
+            self._reposition()
+        else:
+            self._start_native()
         self._tick()
+        self._poll_native()
+
+    # ---- modern styles (native taskbar widget) ----
+
+    @property
+    def _classic(self) -> bool:
+        return self.style == "classic"
+
+    def _start_native(self) -> None:
+        """Create the native taskbar widget; fall back to classic on failure."""
+        self._native = NativeTaskbarWidget(side=self.side)
+        if not self._native.hwnd:
+            logging.getLogger(__name__).warning(
+                "native taskbar widget unavailable; falling back to classic strip")
+            self._native = None
+            self.style = "classic"
+            self._create_window()
+            self._reposition()
+            return
+        self._render_sig = None
+        self._menu = tk.Menu(self._parent_root, tearoff=0, bg=PANEL, fg=FG,
+                             activebackground=ACCENT, activeforeground="white",
+                             borderwidth=0)
+        if not self.visible:
+            self._native.hide()
+
+    def _stop_native(self) -> None:
+        if self._native is not None:
+            self._native.close()
+            self._native = None
+
+    def _poll_native(self) -> None:
+        """Drain input events from the widget thread (60 ms cadence so clicks
+        feel instant; the 1 s tick is too slow for that)."""
+        try:
+            nat = self._native
+            while nat is not None:
+                try:
+                    ev = nat.events.get_nowait()
+                except queue.Empty:
+                    break
+                kind = ev[0]
+                if kind == "click":
+                    self.on_left_click_cb()
+                elif kind == "menu":
+                    self._popup_menu(*self._parent_root.winfo_pointerxy())
+                elif kind in ("hover", "rerender"):
+                    if kind == "hover":
+                        self._native_hover = bool(ev[1])
+                    self._render_sig = None
+                    self._render(self.orch.snapshot())
+        except Exception:
+            logging.getLogger(__name__).exception("native widget poll failed")
+        finally:
+            try:
+                self._parent_root.after(60, self._poll_native)
+            except tk.TclError:
+                pass
+
+    def set_style(self, style: str) -> None:
+        """Switch between bars / rings / classic and persist."""
+        if style not in STRIP_STYLES or style == self.style:
+            return
+        cfg = load_config()
+        cfg.setdefault("strip", {})
+        cfg["strip"]["style"] = style
+        save_config(cfg)
+        was_classic = self._classic
+        self.style = style
+        if was_classic and not self._classic:
+            if self._win_alive():
+                self.win.destroy()
+            self.win = None
+            self.drag_mode = False
+            self._start_native()
+        elif not was_classic and self._classic:
+            self._stop_native()
+            self._create_window()
+            self._validate_custom_pos()
+            self._reposition()
+        self._render_sig = None
+        try:
+            self._render(self.orch.snapshot())
+        except Exception:
+            logging.getLogger(__name__).exception("strip redraw on style change failed")
+
+    def _modern_items(self, s) -> list:
+        u = s.usage
+        rpt = s.report
+        stale = u is not None and is_usage_stale(s)
+        stale_txt = t("stale_mark")
+        if stale:
+            age = usage_age_seconds(s.last_api_fetch)
+            if age >= 0:
+                stale_txt = f"{stale_txt} {fmt_age(age)}"
+        items: list[strip_render.Item] = []
+
+        def quota(label: str, pct: float, mins: int, active: bool,
+                  total_min: int) -> None:
+            time_pct = None
+            if stale:
+                level, sub = "stale", stale_txt
+            else:
+                level = "danger" if pct >= 90 else "warn" if pct >= 75 else "ok"
+                sub = (t("resets_in_short").format(left=fmt_minutes(mins))
+                       if active else t("idle_short"))
+                if active and total_min > 0:
+                    # Same quantity as classic display mode 4: how much of the
+                    # window's time has elapsed, to compare against usage.
+                    time_pct = max(0.0, min(100.0,
+                                            (total_min - mins) / total_min * 100))
+            items.append(strip_render.Item(label, f"{pct:.0f}%", pct, sub,
+                                           level, sub_warn=stale,
+                                           time_pct=time_pct))
+
+        if u is not None:
+            if u.has_five_hour:  # Ultra has no 5h limit
+                quota(t("lbl_5h_window"), u.five_hour_pct,
+                      u.five_hour_minutes_to_reset, u.five_hour_active,
+                      TOTAL_5H_MIN)
+            quota(t("lbl_weekly"), u.seven_day_pct,
+                  u.seven_day_minutes_to_reset, u.seven_day_active,
+                  TOTAL_7D_MIN)
+            for sl in u.scoped_limits[:3]:
+                quota(sl.name, sl.pct, sl.minutes_to_reset, sl.active,
+                      TOTAL_7D_MIN)
+        if rpt is not None:
+            items.append(strip_render.Item(
+                t("today"), f"${rpt.today.cost_usd:,.2f}", None))
+        if not items:
+            items.append(strip_render.Item("Claude", t("loading"), None))
+        return items
+
+    def _render_modern(self, s) -> None:
+        nat = self._native
+        if nat is None:
+            return
+        items = self._modern_items(s)
+        light = taskbar_is_light()
+        sig = (tuple(items), self.style, light, round(nat.scale, 3),
+               self._native_hover)
+        if sig == self._render_sig:
+            return
+        self._render_sig = sig
+        theme = strip_render.LIGHT if light else strip_render.DARK
+        nat.update(strip_render.render(self.style, items, theme, nat.scale,
+                                       hover=self._native_hover))
+
+    def _popup_menu(self, x: int, y: int) -> None:
+        self._rebuild_menu()
+        try:
+            self._menu.tk_popup(x, y)
+        finally:
+            self._menu.grab_release()
 
     def _create_window(self) -> None:
         """Build — or REBUILD — the strip's Toplevel + canvas + bindings + menu.
@@ -1410,6 +1612,8 @@ class TaskbarStrip:
 
     def _win_alive(self) -> bool:
         """True if the strip's Toplevel still exists (wasn't torn down externally)."""
+        if self.win is None:
+            return False
         try:
             return bool(self.win.winfo_exists())
         except tk.TclError:
@@ -1585,6 +1789,10 @@ class TaskbarStrip:
 
     def show(self) -> None:
         self.visible = True
+        if not self._classic:
+            if self._native is not None:
+                self._native.show()
+            return
         # Resurrect immediately if an external event destroyed the window while
         # it was hidden — otherwise show() would raise "bad window path name".
         if not self._win_alive():
@@ -1601,6 +1809,8 @@ class TaskbarStrip:
 
     def hide(self) -> None:
         self.visible = False
+        if self._native is not None:
+            self._native.hide()
         if self._win_alive():
             try:
                 self.win.withdraw()
@@ -1662,6 +1872,10 @@ class TaskbarStrip:
     def set_drag_mode(self, enabled: bool) -> None:
         """Toggle drag-to-reposition mode. Visual cues: 4-way move cursor on
         hover, plus a thin ACCENT-colored outline rectangle drawn by _render."""
+        if not self._classic:
+            # Modern styles dock to the taskbar automatically; no free drag.
+            self.drag_mode = False
+            return
         self.drag_mode = enabled
         cursor = "fleur" if enabled else ""
         try:
@@ -1701,6 +1915,8 @@ class TaskbarStrip:
         cfg["strip"].pop("x", None)
         cfg["strip"].pop("y", None)
         save_config(cfg)
+        if self._native is not None:
+            self._native.set_side(side)
         # Force geometry recompute on the new side.
         self._applied_geom = None
         self._reposition()
@@ -1734,11 +1950,7 @@ class TaskbarStrip:
             logging.getLogger(__name__).exception("strip redraw on mode change failed")
 
     def _on_right_click(self, event) -> None:
-        self._rebuild_menu()
-        try:
-            self._menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self._menu.grab_release()
+        self._popup_menu(event.x_root, event.y_root)
 
     def _tick(self) -> None:
         # The reschedule MUST be unconditional — it lives in `finally` AND fires
@@ -1747,6 +1959,11 @@ class TaskbarStrip:
         # chain = a permanently frozen/missing strip, which we make structurally
         # impossible.
         try:
+            if not self._classic:
+                # Modern styles: the widget thread owns placement + z-order;
+                # we only refresh the picture (countdowns tick every minute).
+                self._render(self.orch.snapshot())
+                return  # `finally` still reschedules
             if not self._win_alive():
                 # An external event (RDP/RustDesk session switch, display/DPI
                 # change, explorer restart) tore the window down. Rebuild it —
@@ -1856,6 +2073,11 @@ class TaskbarStrip:
             parts.append((f"{elapsed_pct}%", FG, self.font_main))
 
     def _render(self, s) -> None:
+        if not self._classic:
+            self._render_modern(s)
+            return
+        if not self._win_alive():
+            return
         u = s.usage
         rpt = s.report
 
@@ -1865,10 +2087,11 @@ class TaskbarStrip:
         stale = u is not None and is_usage_stale(s)
         parts: list[tuple[str, str, tkfont.Font]] = []
         if u is not None:
-            self._append_quota_parts(parts, t("5h"), u.five_hour_pct,
-                                     u.five_hour_minutes_to_reset, TOTAL_5H_MIN,
-                                     active=u.five_hour_active, stale=stale)
-            parts.append(("   ·   ", FG_DIM, self.font_dim))
+            if u.has_five_hour:  # Ultra has no 5h limit — omit it entirely
+                self._append_quota_parts(parts, t("5h"), u.five_hour_pct,
+                                         u.five_hour_minutes_to_reset, TOTAL_5H_MIN,
+                                         active=u.five_hour_active, stale=stale)
+                parts.append(("   ·   ", FG_DIM, self.font_dim))
             self._append_quota_parts(parts, t("7d"), u.seven_day_pct,
                                      u.seven_day_minutes_to_reset, TOTAL_7D_MIN,
                                      active=u.seven_day_active, stale=stale)
@@ -2271,13 +2494,19 @@ class SettingsWindow:
 
         strip = self.strip
 
-        # Visibility + background
+        # Visibility
         self.strip_show_var = tk.BooleanVar(value=bool(strip and strip.visible))
         self._checkbox(inner, t("strip_show"), self.strip_show_var,
                        self._on_strip_show)
-        self.strip_bg_var = tk.BooleanVar(value=bool(strip and strip.show_background))
-        self._checkbox(inner, t("strip_opaque_bg"), self.strip_bg_var,
-                       self._on_strip_bg)
+
+        # Style (bars / rings are the native taskbar widget; classic = old strip)
+        self._section(inner, t("strip_style"))
+        cur_style = strip.style if strip else load_config().get(
+            "strip", {}).get("style", STRIP_STYLE_DEFAULT)
+        self.strip_style_var = tk.StringVar(value=cur_style)
+        for st in STRIP_STYLES:
+            self._radio(inner, t(f"style_{st}"), self.strip_style_var, st,
+                        self._on_strip_style)
 
         # Screen position
         self._section(inner, t("strip_screen_pos"))
@@ -2285,6 +2514,12 @@ class SettingsWindow:
         self.strip_side_var = tk.StringVar(value=cur_side)
         self._radio(inner, t("pos_left"), self.strip_side_var, "left", self._on_strip_side)
         self._radio(inner, t("pos_right"), self.strip_side_var, "right", self._on_strip_side)
+
+        # Everything below only affects the classic text strip.
+        self._section(inner, t("classic_only"))
+        self.strip_bg_var = tk.BooleanVar(value=bool(strip and strip.show_background))
+        self._checkbox(inner, t("strip_opaque_bg"), self.strip_bg_var,
+                       self._on_strip_bg)
 
         # Display mode (radios with example strings)
         self._section(inner, t("strip_display_mode"))
@@ -2331,6 +2566,10 @@ class SettingsWindow:
     def _on_strip_bg(self) -> None:
         if self.strip:
             self._marshal(lambda: self.strip.set_show_background(bool(self.strip_bg_var.get())))
+
+    def _on_strip_style(self) -> None:
+        if self.strip:
+            self._marshal(lambda: self.strip.set_style(self.strip_style_var.get()))
 
     def _on_strip_side(self) -> None:
         if self.strip:
@@ -2591,12 +2830,16 @@ def main() -> int:
     def on_change() -> None:
         s = orch.snapshot()
         if s.usage is not None:
-            pct = s.usage.five_hour_pct
-            tooltip = (
-                f"{t('win_title')} v{__version__}\n"
-                f"5h: {pct:.0f}%  resets {fmt_minutes(s.usage.five_hour_minutes_to_reset)}\n"
-                f"7d: {s.usage.seven_day_pct:.0f}%  resets {fmt_minutes(s.usage.seven_day_minutes_to_reset)}"
-            )
+            u = s.usage
+            # Badge the 5h% when the plan has one; on Ultra (no 5h limit) the
+            # weekly limit is the binding one, so badge that instead.
+            pct = u.five_hour_pct if u.has_five_hour else u.seven_day_pct
+            tooltip = f"{t('win_title')} v{__version__}\n"
+            if u.has_five_hour:
+                tooltip += (f"5h: {u.five_hour_pct:.0f}%  resets "
+                            f"{fmt_minutes(u.five_hour_minutes_to_reset)}\n")
+            tooltip += (f"7d: {u.seven_day_pct:.0f}%  resets "
+                        f"{fmt_minutes(u.seven_day_minutes_to_reset)}")
             # Bounded so truncation (see TrayApp.TOOLTIP_MAX) drops whole
             # buckets rather than cutting a line mid-number.
             for sl in s.usage.scoped_limits[:FloatingWindow.SCOPED_ROWS_MAX]:
