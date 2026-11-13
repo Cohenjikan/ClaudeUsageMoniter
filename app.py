@@ -497,6 +497,54 @@ _user32.SystemParametersInfoW.argtypes = [
 ]
 _user32.SystemParametersInfoW.restype = wintypes.BOOL
 
+# ---- Taskbar-owned docking (the trick Soda Music's taskbar player uses) ----
+# Instead of fighting the taskbar for HWND_TOPMOST every second, make the
+# taskbar (Shell_TrayWnd) the strip's OWNER. Windows always keeps an owned
+# window above its owner in z-order, so the strip sits on the taskbar band
+# with no bump loop and no blink. The owner is set with
+# SetWindowLongPtrW(GWLP_HWNDPARENT) — on a top-level window that changes the
+# owner, not the parent, so the strip stays a normal top-level window in our
+# own process (unlike SetParent-style embedding, no cross-process child).
+# Explorer restarts give the taskbar a new HWND; the strip tick re-attaches.
+_GWLP_HWNDPARENT = -8
+_GWL_EXSTYLE = -20
+_WS_EX_TOOLWINDOW = 0x00000080
+_WS_EX_NOACTIVATE = 0x08000000
+_user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+_user32.FindWindowW.restype = wintypes.HWND
+_user32.IsWindow.argtypes = [wintypes.HWND]
+_user32.IsWindow.restype = wintypes.BOOL
+_user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+_user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+_user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+_user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+
+
+def find_taskbar_hwnd() -> int:
+    """HWND of the primary taskbar (Shell_TrayWnd), or 0 if the shell isn't up."""
+    return int(_user32.FindWindowW("Shell_TrayWnd", None) or 0)
+
+
+def attach_to_taskbar(hwnd: int) -> int:
+    """Make the primary taskbar the owner of top-level `hwnd` and mark it
+    no-activate/tool-window (clicks don't steal focus, no Alt+Tab entry).
+    Returns the taskbar HWND on success, 0 if there is no taskbar."""
+    taskbar = find_taskbar_hwnd()
+    if not taskbar or not hwnd:
+        return 0
+    ex = _user32.GetWindowLongPtrW(hwnd, _GWL_EXSTYLE)
+    _user32.SetWindowLongPtrW(
+        hwnd, _GWL_EXSTYLE, ex | _WS_EX_NOACTIVATE | _WS_EX_TOOLWINDOW)
+    _user32.SetWindowLongPtrW(hwnd, _GWLP_HWNDPARENT, taskbar)
+    flags = _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE
+    _user32.SetWindowPos(hwnd, _HWND_TOPMOST, 0, 0, 0, 0, flags)
+    return taskbar
+
+
+def taskbar_owner_of(hwnd: int) -> int:
+    """Current owner HWND of `hwnd` (0 if none)."""
+    return int(_user32.GetWindowLongPtrW(hwnd, _GWLP_HWNDPARENT) or 0)
+
 # kernel32 for the single-instance named mutex (see main()). CreateMutexW takes a
 # LPSECURITY_ATTRIBUTES (NULL here), a BOOL initial-owner, and the name; the HANDLE
 # return is irrelevant — we only care whether GetLastError() reports the name
@@ -1325,12 +1373,40 @@ class TaskbarStrip:
         if not self.visible:
             self.win.withdraw()
 
+        # Dock under the taskbar as owner (Soda Music's approach) — after
+        # this the taskbar can no longer bury us, so the bump loop goes quiet.
+        self._owner_taskbar = 0
+        self._ensure_taskbar_owner()
+
         # (Re)assert position + topmost. The burst counters post-create races:
         # the shell still settling at boot, or the taskbar reclaiming topmost
         # right after a session switch.
         self._reposition()
         for delay_ms in (300, 700, 1500, 3000, 6000, 10000):
             self.win.after(delay_ms, self._startup_bump)
+
+    def _ensure_taskbar_owner(self) -> None:
+        """(Re)attach the strip to the current taskbar as its owner.
+
+        Cheap enough to run every tick: it only acts when the owner is missing
+        or stale (explorer.exe restarted → new Shell_TrayWnd HWND)."""
+        try:
+            self.win.update_idletasks()
+            hwnd = int(self.win.wm_frame(), 16)
+        except (ValueError, tk.TclError):
+            return
+        taskbar = find_taskbar_hwnd()
+        if taskbar and taskbar_owner_of(hwnd) == taskbar:
+            self._owner_taskbar = taskbar
+            return
+        try:
+            self._owner_taskbar = attach_to_taskbar(hwnd)
+        except OSError:
+            self._owner_taskbar = 0
+        logging.getLogger(__name__).info(
+            "strip: taskbar owner %s (hwnd=%#x)",
+            f"{self._owner_taskbar:#x}" if self._owner_taskbar else "unavailable",
+            hwnd)
 
     def _win_alive(self) -> bool:
         """True if the strip's Toplevel still exists (wasn't torn down externally)."""
@@ -1442,7 +1518,7 @@ class TaskbarStrip:
         except OSError:
             pass
 
-    def _is_covered(self) -> bool:
+    def _is_covered(self, only_by: int = 0) -> bool:
         """Detect whether another top-level window is in front of us.
 
         Strategy: sample 5 horizontally-spread points across our strip and ask
@@ -1459,6 +1535,10 @@ class TaskbarStrip:
 
         Returns True only if *no* sample point reports us — i.e., we're
         confidently covered. False if at least one point shows us on top.
+
+        With `only_by` set, also return False as soon as some OTHER window
+        (not `only_by`) is in front — e.g. a Start menu or flyout that is
+        legitimately above the taskbar and that we shouldn't fight.
         """
         if not self.visible:
             return False
@@ -1479,6 +1559,8 @@ class TaskbarStrip:
             root_hwnd = _user32.GetAncestor(top_hwnd, _GA_ROOT) or top_hwnd
             if int(root_hwnd) == our_hwnd:
                 return False
+            if only_by and int(root_hwnd) != only_by:
+                return False
         return True
 
     def _startup_bump(self) -> None:
@@ -1492,6 +1574,11 @@ class TaskbarStrip:
         the first ~10 s to win that race promptly.
         """
         if not self.visible:
+            return
+        # Retry the taskbar owner too: at boot the shell may not exist yet.
+        self._ensure_taskbar_owner()
+        if self._owner_taskbar:
+            self._force_topmost_winapi()  # owned: no off→on toggle needed
             return
         self._force_topmost()
         self._force_topmost_winapi()
@@ -1673,12 +1760,18 @@ class TaskbarStrip:
             if self.visible:
                 self._tick_count += 1
                 self._reposition()
-                # Topmost policy (A3): only do the disruptive off→on toggle when we
-                # actually detect we're covered (post-Settings/Quick-Settings flyout,
-                # post-autostart shell init). When already on top, a periodic
-                # non-disruptive SetWindowPos(HWND_TOPMOST) reassert — no toggle —
-                # defends z-order without risking the blink the toggle could cause.
-                if self._is_covered():
+                self._ensure_taskbar_owner()
+                if self._owner_taskbar:
+                    # Taskbar-owned: Windows keeps us above the taskbar by
+                    # itself. No toggle bump (no blink), and we don't fight
+                    # Start/flyouts that sit above the taskbar on purpose.
+                    # Only nudge if the taskbar itself somehow ends up in
+                    # front of us.
+                    if self._is_covered(only_by=self._owner_taskbar):
+                        self._force_topmost_winapi()
+                # Legacy topmost policy (A3), used when no taskbar owner
+                # could be attached (shell not up yet, exotic shells)
+                elif self._is_covered():
                     self._force_topmost()
                     self._force_topmost_winapi()
                 elif self._tick_count % 20 == 0:
