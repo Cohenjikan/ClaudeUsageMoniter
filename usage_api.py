@@ -81,6 +81,12 @@ class UsageSnapshot:
     fetched_at: float             # Unix timestamp when this snapshot was taken
     raw: dict[str, Any]           # Full response body for debugging / future fields
     scoped_limits: tuple[ScopedLimit, ...] = ()  # model-scoped weekly buckets (Fable, …)
+    # False when the plan has NO 5-hour session limit at all (Ultra). The
+    # server then sends `"five_hour": null`, which is distinct from an idle
+    # 5h window (an object with utilization 0 and no resets_at). Note the
+    # local credentials file can lag behind (still saying "max") after an
+    # upgrade, so the response body is the source of truth.
+    has_five_hour: bool = True
 
     @property
     def five_hour_minutes_to_reset(self) -> int:
@@ -376,7 +382,28 @@ def snapshot_from_body(body: dict[str, Any], fetched_at: float) -> UsageSnapshot
         fetched_at=fetched_at,
         raw=body,
         scoped_limits=_parse_scoped_limits(body),
+        has_five_hour=_has_five_hour_limit(body),
     )
+
+
+def _has_five_hour_limit(body: dict[str, Any]) -> bool:
+    """True if the plan has a 5-hour session limit. An idle-but-existing 5h
+    window still comes back as an object; plans without one (Ultra) get
+    `"five_hour": null` and no session-type entry in `limits`."""
+    if isinstance(body.get("five_hour"), dict):
+        return True
+    limits = body.get("limits")
+    if isinstance(limits, list):
+        for lim in limits:
+            if not isinstance(lim, dict):
+                continue
+            kind = str(lim.get("kind") or "")
+            group = str(lim.get("group") or "")
+            if kind.startswith(("five_hour", "session")) or group in ("five_hour", "session"):
+                return True
+    # Older/odd responses that omit the key entirely: keep the legacy behavior
+    # (show 5h) rather than silently hiding a real limit.
+    return "five_hour" not in body
 
 
 def fetch_usage(token: str | None = None, *, user_agent: str = DEFAULT_UA) -> UsageSnapshot:
