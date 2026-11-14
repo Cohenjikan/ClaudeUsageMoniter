@@ -1,6 +1,16 @@
 """Read Claude Code OAuth credentials and call the /api/oauth/usage endpoint.
 
 This is the data-layer module — pure functions, no UI.
+
+STRICTLY READ-ONLY. This module never refreshes the OAuth token and never
+writes ~/.claude/.credentials.json. The refresh_token in that file is shared
+with Claude Code and rotates on every use; refreshing it from here would race
+Claude Code and can log the user out, and it would also mean impersonating
+Claude Code's OAuth client. When the access token Claude Code maintains is
+expired we simply wait for Claude Code to rotate it.
+
+The usage endpoint is only the FALLBACK quota source. The primary source is the
+Claude Code statusLine bridge (see statusline.py), which needs no token at all.
 """
 from __future__ import annotations
 
@@ -12,34 +22,18 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from paths import CLAUDE_DIR
+
 # Anthropic internal OAuth usage endpoint (undocumented but stable; used by Claude Code itself
 # and by tools like CodeZeno's Claude-Code-Usage-Monitor and Maciek-roboblog's monitor).
 USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
-
-# OAuth token refresh endpoint + Claude Code's OAuth client_id (matches Claude
-# Code 2.1.x's bundled OAuth config). Refresh tokens rotate on every use, so any
-# caller of `refresh_oauth` MUST persist the returned refresh_token immediately —
-# otherwise the next refresh will hit invalid_grant and force a re-login.
-OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
-CLAUDE_CODE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-DEFAULT_CLAUDE_AI_SCOPES = (
-    "user:profile",
-    "user:inference",
-    "user:sessions:claude_code",
-    "user:mcp_servers",
-    "user:file_upload",
-)
 
 # User-Agent must look like Claude Code or the endpoint hits a much tighter rate-limit bucket.
 # See: github.com/anthropics/claude-code/issues/31021
 DEFAULT_UA = "claude-code/2.0.0"
 
 # Path to Claude Code's local OAuth credentials (Windows / macOS / Linux all use ~/.claude).
-CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
-
-
-class CredentialsChangedError(RuntimeError):
-    """Raised when credentials changed on disk during a refresh cycle."""
+CREDENTIALS_PATH = CLAUDE_DIR / ".credentials.json"
 
 
 @dataclass
@@ -81,6 +75,12 @@ class UsageSnapshot:
     fetched_at: float             # Unix timestamp when this snapshot was taken
     raw: dict[str, Any]           # Full response body for debugging / future fields
     scoped_limits: tuple[ScopedLimit, ...] = ()  # model-scoped weekly buckets (Fable, …)
+    # False when the plan has NO 5-hour session limit at all (Ultra). The
+    # server then sends `"five_hour": null`, which is distinct from an idle
+    # 5h window (an object with utilization 0 and no resets_at). Note the
+    # local credentials file can lag behind (still saying "max") after an
+    # upgrade, so the response body is the source of truth.
+    has_five_hour: bool = True
 
     @property
     def five_hour_minutes_to_reset(self) -> int:
@@ -121,7 +121,6 @@ def _minutes_until_iso(iso_ts: str) -> int:
 class OAuthCreds:
     """Claude Code's stored OAuth state, with a convenience expiry check."""
     access_token: str
-    refresh_token: str
     expires_at_unix: float    # Unix seconds (not ms)
     scopes: tuple[str, ...] = ()
 
@@ -158,100 +157,9 @@ def load_oauth_creds(creds_path: Path = CREDENTIALS_PATH) -> OAuthCreds:
         )
     return OAuthCreds(
         access_token=access,
-        refresh_token=oauth.get("refreshToken") or "",
         expires_at_unix=(oauth.get("expiresAt") or 0) / 1000,
         scopes=tuple(oauth.get("scopes") or ()),
     )
-
-
-def refresh_oauth(refresh_token: str, *, scopes: tuple[str, ...] = (),
-                  user_agent: str = DEFAULT_UA) -> dict[str, Any]:
-    """POST the refresh_token to Anthropic's OAuth endpoint and return the raw
-    response dict — keys include `access_token`, `refresh_token`, `expires_in`,
-    `scope`, `token_uuid`, etc.
-
-    NOTE: refresh tokens **rotate** on every successful use. The previous
-    refresh_token is invalidated server-side as soon as this call returns
-    success. The caller MUST persist the new refresh_token immediately or any
-    future refresh will fail with HTTP 400 `invalid_grant`.
-
-    Raises urllib.error.HTTPError on Anthropic-side rejection (most commonly
-    400 invalid_grant if the supplied refresh_token was already consumed).
-    """
-    body = json.dumps({
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-        "client_id": CLAUDE_CODE_CLIENT_ID,
-        "scope": " ".join(scopes or DEFAULT_CLAUDE_AI_SCOPES),
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        OAUTH_TOKEN_URL, data=body, method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": user_agent,
-            "anthropic-beta": "oauth-2025-04-20",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def save_oauth_creds(new_access: str, new_refresh: str, expires_in_sec: int,
-                     creds_path: Path = CREDENTIALS_PATH,
-                     expected_refresh_token: str | None = None) -> None:
-    """Atomically write new OAuth tokens back to credentials.json, preserving
-    every other field (organization id, account info, scopes — anything Claude
-    Code put there besides accessToken/refreshToken/expiresAt).
-
-    Atomicity: writes to a sibling .json.tmp first, then `Path.replace()` —
-    a crash mid-write therefore can never leave a half-written file that
-    would force the user to /login again.
-    """
-    if creds_path.exists():
-        with open(creds_path, encoding="utf-8") as f:
-            creds = json.load(f)
-    else:
-        creds = {}
-    oauth = creds.setdefault("claudeAiOauth", {})
-    if (
-        expected_refresh_token is not None
-        and oauth.get("refreshToken") != expected_refresh_token
-    ):
-        raise CredentialsChangedError(
-            "Claude Code credentials changed while refresh was in flight"
-        )
-    oauth["accessToken"] = new_access
-    oauth["refreshToken"] = new_refresh
-    oauth["expiresAt"] = int((time.time() + expires_in_sec) * 1000)
-
-    tmp = creds_path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(creds, indent=2), encoding="utf-8")
-    tmp.replace(creds_path)
-
-
-def refresh_and_save(creds_path: Path = CREDENTIALS_PATH) -> OAuthCreds:
-    """Read disk → refresh via OAuth endpoint → write disk → return new creds.
-
-    The save-back is non-negotiable here precisely because refresh_token
-    rotation means a refresh-without-save burns the only working token.
-    """
-    current = load_oauth_creds(creds_path)
-    if not current.refresh_token:
-        raise ValueError("No refresh_token available; please /login in Claude Code")
-    resp = refresh_oauth(current.refresh_token, scopes=current.scopes)
-    try:
-        save_oauth_creds(
-            new_access=resp["access_token"],
-            new_refresh=resp["refresh_token"],
-            expires_in_sec=int(resp.get("expires_in", 28800)),
-            creds_path=creds_path,
-            expected_refresh_token=current.refresh_token,
-        )
-    except CredentialsChangedError:
-        # Another process refreshed/logged in and wrote a newer credentials file
-        # before our save. Do not overwrite it; use the fresh on-disk state.
-        return load_oauth_creds(creds_path)
-    return load_oauth_creds(creds_path)
 
 
 def _parse_scoped_limits(body: dict[str, Any]) -> tuple[ScopedLimit, ...]:
@@ -376,7 +284,28 @@ def snapshot_from_body(body: dict[str, Any], fetched_at: float) -> UsageSnapshot
         fetched_at=fetched_at,
         raw=body,
         scoped_limits=_parse_scoped_limits(body),
+        has_five_hour=_has_five_hour_limit(body),
     )
+
+
+def _has_five_hour_limit(body: dict[str, Any]) -> bool:
+    """True if the plan has a 5-hour session limit. An idle-but-existing 5h
+    window still comes back as an object; plans without one (Ultra) get
+    `"five_hour": null` and no session-type entry in `limits`."""
+    if isinstance(body.get("five_hour"), dict):
+        return True
+    limits = body.get("limits")
+    if isinstance(limits, list):
+        for lim in limits:
+            if not isinstance(lim, dict):
+                continue
+            kind = str(lim.get("kind") or "")
+            group = str(lim.get("group") or "")
+            if kind.startswith(("five_hour", "session")) or group in ("five_hour", "session"):
+                return True
+    # Older/odd responses that omit the key entirely: keep the legacy behavior
+    # (show 5h) rather than silently hiding a real limit.
+    return "five_hour" not in body
 
 
 def fetch_usage(token: str | None = None, *, user_agent: str = DEFAULT_UA) -> UsageSnapshot:

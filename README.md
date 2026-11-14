@@ -2,7 +2,7 @@
 
 # ClaudeUsageMonitor
 
-### A featherweight Windows tray app that shows your real Claude Code Pro/Max quota live — piggybacking Claude Code's own login so you never log in twice.
+### A featherweight Windows tray app that shows your real Claude Code Pro/Max quota live — read straight from Claude Code's own status line, so there is nothing to log into and no token to manage.
 
 **English** · **[中文](README.zh.md)**
 
@@ -33,9 +33,9 @@
 
 You live in Claude Code all day. You keep hitting the 5-hour wall or the weekly cap and finding out *only when Claude tells you*. Existing monitors either look like a broken spreadsheet, make you re-login through a browser every few hours, or only count your local logs and never show the real server quota.
 
-**ClaudeUsageMonitor pins the authoritative numbers to your taskbar and stays out of your way.** It reads the same OAuth token Claude Code already wrote to disk, calls Anthropic's own usage endpoint, and shows you exactly how close you are to the limit — before you slam into it.
+**ClaudeUsageMonitor pins the authoritative numbers to your taskbar and stays out of your way.** Claude Code already knows your 5-hour and weekly utilization and hands it to its status-line command; this app captures that, and shows you exactly how close you are to the limit — before you slam into it.
 
-> **The trick:** it uses Claude Code's local OAuth state at `~/.claude/.credentials.json`, and safely refreshes it when the access token expires. There is **no login screen anywhere in this app** — install it and it just works.
+> **The trick:** since v2.1.80 Claude Code pipes a `rate_limits` block to your [status line](https://code.claude.com/docs/en/statusline) command. A tiny bridge captures it to a local file and the tray app watches that file. **No token is read, refreshed or sent, and there is no network request** — so no rate limit either. While Claude Code is idle, an optional **read-only** call to the usage endpoint fills the gap.
 
 ---
 
@@ -43,17 +43,21 @@ You live in Claude Code all day. You keep hitting the 5-hour wall or the weekly 
 
 Benefit first, mechanism second. Everything below is wired to real code in this repo.
 
-### Zero separate login (OAuth piggyback)
-Install and it just works, using the Claude Code session you already have. Nothing to sign into, ever.
-> `usage_api.py` reads `~/.claude/.credentials.json` and re-reads it from disk on **every** call (`load_oauth_creds`, lines 89–112), so it automatically picks up tokens that Claude Code itself rotates. There is no login UI anywhere in the codebase.
+### Token-free, live quota from Claude Code's status line
+Your 5-hour and weekly numbers update every time Claude Code refreshes its status line — no polling interval, no login, no token handling.
+> `statusline_bridge.py` is registered as Claude Code's `statusLine` command (one checkbox in **Settings → General**). It saves only the payload's `rate_limits` block (plus the model name) to `~/.claude/usage-monitor/statusline.json` and prints a status line. If you already had a status line, the bridge **chains** it — your existing command still runs and its output is what you see. `Orchestrator.poll_statusline` (`state.py`) stats that file every 2 s and publishes new data immediately.
 
 ### Real server-side quota, not an estimate
 The 5-hour and weekly percentages are the *same authoritative numbers Claude Code uses*, and they include **all** of your subscription usage — Code **plus** chat/desktop/web — not a guess from local logs.
-> `fetch_usage` (`usage_api.py:189`) GETs `https://api.anthropic.com/api/oauth/usage` and reads `five_hour.utilization` / `seven_day.utilization` straight from the response. The endpoint is undocumented; the `User-Agent` must be `claude-code/2.0.0` or it lands in a tighter rate-limit bucket.
+> Both sources carry Anthropic's own utilization figures. They are normalized into one shape (`statusline.body_from_capture` → `usage_api.snapshot_from_body`), so the UI, alerts and cache treat them identically.
 
-### Self-refreshing auth — no terminal wake-up every 8 hours
-The `refresh_token` in `~/.claude/.credentials.json` is shared with Claude Code and rotates on every successful refresh, so this app treats it carefully: it reads the current disk state, refreshes only when the access token is expired or rejected, and atomically writes the new access/refresh pair back to the same file.
-> `_do_fetch_cycle` (`state.py`) calls `refresh_and_save` when needed, retries once after a 401, and backs off on `invalid_grant` or rate limits. `save_oauth_creds` (`usage_api.py`) verifies the on-disk `refreshToken` is still the one it used before writing, so a newer Claude Code login/refresh is not overwritten.
+### Read-only fallback while Claude Code is idle
+When no Claude Code session is running (say, a chat-only afternoon), the app can still keep the quota current.
+> `fetch_usage` (`usage_api.py`) GETs the undocumented `https://api.anthropic.com/api/oauth/usage` endpoint with the access token Claude Code currently has on disk. It runs every 6 min only while the status line is idle, drops to every 30 min while it is live (just to pick up model-scoped buckets), and can be turned off entirely in **Settings → General**.
+
+### Never touches your login
+This app **never refreshes or writes your OAuth token**. The `refresh_token` in `~/.claude/.credentials.json` is shared with Claude Code and rotates on every use, so refreshing it from a second program can race Claude Code and log you out; it would also mean impersonating Claude Code's OAuth client.
+> `usage_api.py` contains no refresh or write code at all (a unit test asserts it). If the on-disk access token is expired or rejected, the API fallback just waits — re-reading the file every 45 s, no network — and recovers the moment Claude Code rotates it. With the status-line source on, an expired token doesn't matter in the first place.
 
 ### Always-visible taskbar strip
 A tiny borderless readout sits right on the Windows taskbar, so your quota is glanceable without opening anything.
@@ -65,6 +69,8 @@ A tiny borderless readout sits right on the Windows taskbar, so your quota is gl
 ### Stays on top of the Win11 shell
 The strip doesn't get buried by maximized windows, the taskbar, or autostart races at boot.
 > Three defenses in `app.py`: a per-tick topmost bump (`_force_topmost`), a direct `SetWindowPos(HWND_TOPMOST)` backup (`_force_topmost_winapi`), and `WindowFromPoint` multi-point coverage detection (`_is_covered`) — plus a startup bump burst from 300 ms to 10 s.
+>
+> **Experimental: embed inside the taskbar.** **Settings → Strip → Embed inside the taskbar** turns the strip into a child window of the taskbar (`Shell_TrayWnd`), the approach TrafficMonitor uses on Win11. A child of the taskbar is drawn as part of it, so nothing can cover it and none of the topmost machinery runs. It relies on undocumented shell internals, so it is off by default; if embedding fails (shell not up yet, blocked by security software) the strip stays in topmost mode and retries every ~5 s, and an `explorer.exe` restart is healed automatically (`TaskbarStrip._try_embed` / `_embed_healthy`). Drag mode is disabled while embedded.
 
 ### Drag-to-place, position persists
 Put the strip wherever you like; it stays there across restarts.
@@ -100,7 +106,7 @@ Even with no windows open, the system-tray badge tells you your 5-hour usage at 
 
 ### Bilingual UI and a real Settings window
 Switch between English and Chinese, toggle autostart, and choose strip side / opacity / display mode — all from one **tray → Settings** window (General / Strip / About), not buried tray submenus.
-> `LANGUAGES` holds `en` and `zh` dicts driving every visible string; `SettingsWindow` (`app.py`) is a dark-themed `Toplevel` with a custom segmented tab bar. It offers the language picker, the **Run at startup** checkbox, strip side (left/right), opaque background, and four display modes (compact / +time-remaining / +time-remaining% / +time-elapsed%). Live changes apply immediately and persist to `config.json`.
+> `LANGUAGES` holds `en` and `zh` dicts driving every visible string; `SettingsWindow` (`app.py`) is a dark-themed `Toplevel` with a custom segmented tab bar. It offers the language picker, the **Run at startup** checkbox, the quota-source switches (status line / read-only API fallback) with a live status label, strip side (left/right), opaque background, taskbar embedding, and four display modes (compact / +time-remaining / +time-remaining% / +time-elapsed%). Live changes apply immediately and persist to `config.json`.
 
 ### Boots instantly, never silently freezes
 The window shows your last-known quota the moment it opens — even before the first network call — and only one copy ever runs. If the data pipeline ever stalls (expired token, dead network), the quota is greyed and marked **stale** with its age, so it reads as *old data*, never as a frozen app.
@@ -110,65 +116,58 @@ The window shows your last-known quota the moment it opens — even before the f
 
 ## Quickstart
 
-**Prerequisites:** Windows 10/11 · Python 3.11+ · Claude Code **already logged in** (so `~/.claude/.credentials.json` exists).
+**Prerequisites:** Windows 10/11 · Claude Code installed and logged in with a Pro/Max plan.
+
+### Option A — download the exe (no Python needed)
+
+1. Grab `ClaudeUsageMonitor-win64.zip` from the [latest release](https://github.com/Cohenjikan/ClaudeUsageMoniter/releases/latest) and unzip it anywhere you can write to (e.g. `D:\Apps\ClaudeUsageMonitor`). Settings and the cache are stored next to the exe.
+2. Run `ClaudeUsageMonitor.exe`.
+
+### Option B — run from source (Python 3.11+)
 
 ```powershell
-# 1. Clone
 git clone https://github.com/Cohenjikan/ClaudeUsageMoniter D:\Apps\cc-usage-tray
 cd D:\Apps\cc-usage-tray
-
-# 2. Install dependencies (tkinter ships with Python)
-pip install pystray Pillow winotify
-
-# 3. Run — use pythonw (no console window)
-pythonw.exe app.py
+pip install -r requirements.txt     # tkinter ships with Python
+pythonw.exe app.py                  # pythonw = no console window
 ```
 
-That's it. A tray icon appears with your live 5h%, and the strip pins to your taskbar. **No login prompt — it rides the Claude Code session you already have.**
+### Turn on the status-line source (recommended)
+
+Open **tray → Settings → General** and tick **Claude Code status line**. This adds a `statusLine` entry to `~/.claude/settings.json` (a backup is saved as `settings.json.bak-usage-monitor`; an existing status line keeps working through the bridge). Unticking it restores your previous status line. The status label under the checkbox shows whether a Claude Code session is feeding live data.
+
+Without it the app still works, using only the read-only API fallback.
 
 ### Optional: launch at startup
 
-Easiest way: open **tray → Settings → General** and tick **Run at startup**. It creates (and removes) the Startup-folder shortcut for you, using `pythonw.exe` so no console window flashes on boot. If an autostart launcher for this app already exists, the checkbox detects it and reflects its state.
-
-Manual alternative — create a shortcut in your Startup folder (`Win+R` → `shell:startup`) pointing to:
-
-```
-Target:    "<python_install>\pythonw.exe" "D:\Apps\cc-usage-tray\app.py"
-Start in:  D:\Apps\cc-usage-tray
-```
-
-Use `pythonw.exe` (not `python.exe`) to avoid a console window flashing on boot.
+Open **tray → Settings → General** and tick **Run at startup**. It creates (and removes) a Startup-folder shortcut to the exe, or to `app.py` via `pythonw.exe` when running from source.
 
 ---
 
-## How the auth works
+## How the quota data flows
 
-The interesting (and undocumented) bit: Anthropic exposes `https://api.anthropic.com/api/oauth/usage`, which returns the same authoritative 5h / weekly utilization Claude Code itself uses. We piggyback on Claude Code's local OAuth token at `~/.claude/.credentials.json` (no separate login) and call the endpoint with:
-
-```http
-Authorization: Bearer <accessToken from credentials>
-anthropic-beta: oauth-2025-04-20
-User-Agent: claude-code/2.0.0     # required — without this you hit a tight rate-limit bucket
-```
-
-Response (shape — values illustrative):
+**Primary — the Claude Code status line.** Claude Code runs your `statusLine` command on every status refresh and pipes it a JSON payload. On Pro/Max plans it includes:
 
 ```json
-{
-  "five_hour": {"utilization": 33.0, "resets_at": "2026-05-26T00:50:00+00:00"},
-  "seven_day": {"utilization": 91.0, "resets_at": "2026-05-26T00:59:59+00:00"}
+"rate_limits": {
+  "five_hour": {"used_percentage": 33, "resets_at": 1767225600},
+  "seven_day": {"used_percentage": 91, "resets_at": 1767600000}
 }
 ```
 
-The endpoint is rate-limited at ~5 requests/token, so we poll it every **6 minutes**. The local JSONL cost view refreshes faster, every **30 seconds**.
+`statusline_bridge.py` (or `cc-usage-statusline.exe` in the release zip) writes that block to `~/.claude/usage-monitor/statusline.json` and prints a status line. The tray app picks up the change within ~2 s.
+
+**Fallback — a read-only usage-endpoint call.** While the status line is idle, the app calls the undocumented `https://api.anthropic.com/api/oauth/usage` with Claude Code's current access token (`anthropic-beta: oauth-2025-04-20`, `User-Agent: claude-code/2.0.0`, without which you land in a tighter rate-limit bucket). It never refreshes the token. The endpoint allows only ~5 requests per token, hence 6-minute polling, slowed to 30 minutes while the status line is live.
+
+**Local costs.** `~/.claude/projects/**/*.jsonl` is parsed every 30 s.
 
 ```mermaid
 flowchart LR
-    A[Claude Code<br/>writes + rotates token] -->|~/.claude/.credentials.json| B[usage_api.py<br/>load_oauth_creds · refresh_and_save]
-    B -->|Bearer token<br/>UA: claude-code/2.0.0| C[/api/oauth/usage<br/>poll 6 min/]
-    B -.->|expired/401?<br/>refresh + atomic save| B
-    C --> D[state.py<br/>Orchestrator]
-    E[~/.claude/projects/**.jsonl] -->|parse 30 s| F[jsonl_costs.py<br/>build_report]
+    CC[Claude Code session] -->|statusLine stdin JSON<br/>rate_limits| BR[statusline_bridge.py]
+    BR -->|~/.claude/usage-monitor/statusline.json| D[state.py<br/>Orchestrator]
+    CR[~/.claude/.credentials.json<br/>read-only] -.->|only while status line idle| API[/api/oauth/usage<br/>≤ every 6 min/]
+    API -.-> D
+    E[~/.claude/projects/**.jsonl] -->|parse 30 s| F[jsonl_costs.py]
     F --> D
     D --> G[Tray icon · Taskbar strip · Floating window]
 ```
@@ -184,9 +183,9 @@ Off-the-shelf options each had a deal-breaker. (The auth/UI mechanism of *this* 
 | [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) | Piggybacks Claude Code OAuth | Pixelated colored blocks | Ugly UI |
 | [SlavomirDurej/claude-usage-widget](https://github.com/SlavomirDurej/claude-usage-widget) | Claude.ai web session | Electron widget | Periodic browser re-login |
 | [ryoppippi/ccusage](https://github.com/ryoppippi/ccusage) | Local JSONL only | CLI / statusline | No GUI · no real server quota |
-| **ClaudeUsageMonitor** | **OAuth piggyback** | **Tray + strip + window** | **Windows-only** |
+| **ClaudeUsageMonitor** | **Claude Code status line** (+ read-only OAuth fallback) | **Tray + strip + window** | **Windows-only** |
 
-This project takes what it wanted from all three: **OAuth-piggyback auth** (zero re-login) + a **clean tkinter UI** + **real server-side quota %** + **per-project cost** from local JSONL. It pins inside the Win11 taskbar band with a 3-mechanism topmost defense, so maximized windows structurally can't cover it — a problem most floating widgets ignore.
+This project takes what it wanted from all three: **zero login** (status line first, read-only OAuth fallback) + a **clean tkinter UI** + **real server-side quota %** + **per-project cost** from local JSONL. It pins inside the Win11 taskbar band with a 3-mechanism topmost defense, so maximized windows structurally can't cover it — a problem most floating widgets ignore.
 
 ---
 
@@ -196,26 +195,32 @@ Read these before you rely on the numbers. They are deliberate, not bugs.
 
 - **The `$` figures are Claude Code (CLI) only.** Today / session / month / per-project dollars come **purely** from local `~/.claude/projects` transcripts. The Claude **desktop app and web chat write no local token counts**, so on a chat-only day **"Today $" stays $0.00**. The 5h/7d **percent** bars are different — those come from the server and **do** include chat + code together. That's the number to watch if you mix the two.
 - **Equivalent-API $ is for comparison, not billing.** You pay a flat Pro/Max subscription. These dollars estimate what the same tokens would cost on the pay-as-you-go API — useful for ranking project value, not for your invoice.
-- **Server quota updates at most every 6 minutes.** The `/api/oauth/usage` endpoint is aggressively rate-limited (~5 requests/token), so percentages can lag real-time usage by a few minutes. Local JSONL cost refreshes every 30 s.
+- **Live updates need a running Claude Code session.** The status-line source only updates while Claude Code is open and refreshing its status line. Otherwise the read-only API fallback updates at most every 6 minutes (the endpoint is aggressively rate-limited), and if you've turned the fallback off the quota is marked stale after 15 minutes. Local JSONL cost refreshes every 30 s.
 - **The strip defaults to your primary monitor.** A dragged position can land on a secondary monitor; **Reset strip position** returns it to primary.
 - **Exclusive-fullscreen games/apps render above everything in user space**, so the strip is hidden while one is in front. Use borderless-windowed mode to keep it visible.
 - **Windows 10/11 only.** Despite the credentials path existing on macOS/Linux, the entire UI is Windows-specific (ctypes/user32, taskbar pinning, `winotify` toasts, a PowerShell-path fix for toast delivery). It is **not** cross-platform.
-- **Requires an existing Claude Code login.** The app has no login of its own; it relies on `~/.claude/.credentials.json` already being there.
-- **Quota goes *stale*, never wrong, if refresh cannot complete.** The app now refreshes the shared OAuth token itself, so it should survive the normal ~8 h access-token expiry without a terminal Claude Code session. If refresh is rejected, rate-limited, or offline, the quota is clearly **greyed and marked stale with its age** until a fresh fetch succeeds.
-- **It relies on an undocumented endpoint and a spoofed User-Agent.** This is not an official or supported Anthropic integration — Anthropic could change the `/api/oauth/usage` endpoint or the `claude-code/2.0.0` UA expectation at any time and break the quota readout.
+- **Requires Claude Code on a Pro/Max plan.** The app has no login of its own. API-key accounts get no `rate_limits` in the status line and have no subscription quota to show.
+- **Quota goes *stale*, never wrong.** If no source can produce fresh data (Claude Code idle and its access token expired, network down, fallback switched off), the quota is clearly **greyed and marked stale with its age**. The app never refreshes the token itself; opening Claude Code rotates it and the quota recovers on its own.
+- **The fallback uses an undocumented endpoint and a Claude Code User-Agent.** That part is not an official or supported Anthropic integration and could break at any time. Anthropic's terms restrict using subscription OAuth tokens in third-party tools; this app only reads usage figures and never sends inference requests, but if you'd rather not touch the token at all, untick **Fallback: read-only usage API** and rely on the status line alone.
+- **Taskbar embedding is experimental.** It depends on undocumented Windows shell internals and may misbehave on some Windows builds; it's off by default.
 
 ---
 
 ## Architecture
 
 ```
-usage_api.py     OAuth token loader/refresher + /api/oauth/usage HTTP client.
-jsonl_costs.py   JSONL parser + cost aggregator (two-tier cache pricing table inline).
-state.py         Two daemon threads: API poll (6 min) and JSONL parse (30 s).
-                 Self-refreshes expired/rejected OAuth tokens, backs off on auth
-                 or rate-limit errors. Threshold alerts fire once per crossing.
-app.py           Entry point: tkinter FloatingWindow + pystray tray icon + TaskbarStrip.
-                 Strip uses a 3-mechanism topmost defense to stay on top of the Win11 shell.
+statusline_bridge.py  Claude Code statusLine command: captures rate_limits, chains
+                      any previous status line, always exits 0.
+statusline.py         Capture format, conversion to the usage-body shape, and
+                      install/uninstall of the bridge in ~/.claude/settings.json.
+usage_api.py          READ-ONLY OAuth token loader + /api/oauth/usage client.
+jsonl_costs.py        JSONL parser + cost aggregator (two-tier cache pricing).
+state.py              Orchestrator: statusline watcher (2 s), throttled read-only
+                      API fallback, JSONL parse (30 s), threshold alerts, cache.
+paths.py              Where runtime files live (next to app.py, or the exe).
+app.py                Entry point: tkinter FloatingWindow + pystray tray icon +
+                      TaskbarStrip (topmost mode or experimental taskbar embed).
+ClaudeUsageMonitor.spec  PyInstaller one-folder build (tray exe + helper exe).
 ```
 
 ---
@@ -232,7 +237,7 @@ STRIP_SIDE_MARGIN = 12            # gap from chosen edge
 STRIP_GAP_FROM_TASKBAR = 0        # gap between strip bottom and taskbar top
 ```
 
-Per-user state (strip position, side, display mode, opaque-background toggle, and language) lives in a `config.json` next to the script — set it by dragging and via **tray → Settings**. The file is per-user and git-ignored, so a fresh clone has none until you create one; delete it or use **Reset position** (Settings → Strip) to snap back to defaults.
+Per-user state (strip position, side, display mode, opaque-background and embed toggles, language, and the `quota.api_fallback` switch) lives in a `config.json` next to `app.py` (or next to the exe) — set it by dragging and via **tray → Settings**. The file is per-user and git-ignored, so a fresh clone has none until you create one; delete it or use **Reset position** (Settings → Strip) to snap back to defaults.
 
 The pricing table is `jsonl_costs.py:PRICING` — update it when Anthropic adjusts rates or ships new model families.
 
@@ -243,9 +248,20 @@ The pricing table is `jsonl_costs.py:PRICING` — update it when Anthropic adjus
 | | |
 |---|---|
 | **OS** | Windows 10 or 11 |
-| **Python** | 3.11+ |
-| **Dependencies** | `pystray`, `Pillow`, `winotify` (tkinter ships with Python) |
-| **Prerequisite** | Claude Code installed and logged in (`~/.claude/.credentials.json` must exist) |
+| **Python** | none for the release exe; 3.11+ to run from source |
+| **Dependencies** | `pystray`, `Pillow`, `winotify` (tkinter ships with Python) — see `requirements.txt` |
+| **Prerequisite** | Claude Code installed and logged in on a Pro/Max plan (v2.1.80+ for the status-line source) |
+
+---
+
+## Development
+
+```powershell
+python -m unittest discover -s tests   # stdlib only; also runs on Linux/macOS
+.\build.ps1                            # tests + PyInstaller build into dist\ClaudeUsageMonitor\
+```
+
+CI (`.github/workflows/build.yml`) runs the tests on Windows, builds the one-folder package, smoke-tests the status-line helper exe, and attaches `ClaudeUsageMonitor-win64.zip` to the GitHub Release when a `v*` tag is pushed.
 
 ---
 
