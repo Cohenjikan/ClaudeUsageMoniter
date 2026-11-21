@@ -13,7 +13,7 @@ Threading model:
   - statusline thread: watches the capture file's mtime (cheap local stat).
   - api thread: polls the usage endpoint, throttled hard while the statusline
     source is fresh.
-  - jsonl thread: re-parses ~/.claude/projects (cheap, every JSONL_INTERVAL_SEC).
+  - jsonl thread: drains transcript changes and publishes a report every JSONL_INTERVAL_SEC.
   - All threads write to AppState fields under _lock; UI reads via snapshot().
 """
 from __future__ import annotations
