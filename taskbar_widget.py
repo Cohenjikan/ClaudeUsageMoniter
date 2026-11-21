@@ -170,6 +170,7 @@ class NativeTaskbarWidget:
         self._image: Image.Image | None = None
         self._visible = True
         self._hover = False
+        self._suppressed = False  # taskbar demoted by a fullscreen app
         self._taskbar = 0
         self._msg_taskbar_created = -1  # set once the window exists
         self._ready = threading.Event()
@@ -255,12 +256,22 @@ class NativeTaskbarWidget:
             u32.SetWindowLongPtrW(self.hwnd, GWLP_HWNDPARENT, tb)
             log.info("taskbar widget: re-attached to taskbar %#x", tb)
             self._refresh_scale()
-        # Mirror the taskbar's topmost state: when a fullscreen app demotes
-        # the taskbar we must not float above that app either.
+        # A fullscreen app (video player, game) makes explorer demote the
+        # taskbar to non-topmost. Then we must not touch z-order at all:
+        # SetWindowPos(HWND_NOTOPMOST) — or showing the window — lifts us to
+        # the top of the non-topmost band, and because we're OWNED by the
+        # taskbar the system drags the taskbar up with us, over the fullscreen
+        # app. So hide until the taskbar is topmost again, and only re-assert
+        # topmost when it actually differs (no per-tick z-order bump).
         if self._taskbar:
             tb_top = bool(u32.GetWindowLongPtrW(self._taskbar, GWL_EXSTYLE) & WS_EX_TOPMOST)
-            u32.SetWindowPos(self.hwnd, HWND_TOPMOST if tb_top else HWND_NOTOPMOST,
-                             0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+            self._suppressed = not tb_top
+            if self._suppressed:
+                if u32.IsWindowVisible(self.hwnd):
+                    u32.ShowWindow(self.hwnd, SW_HIDE)
+            elif not (u32.GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST):
+                u32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
 
     def _target_pos(self, w: int, h: int) -> tuple[int, int] | None:
         if not self._taskbar:
@@ -291,7 +302,7 @@ class NativeTaskbarWidget:
     def _apply(self) -> None:
         with self._lock:
             img = self._image
-        if img is None:
+        if img is None or self._suppressed:
             return
         w, h = img.size
         pos = self._target_pos(w, h)
@@ -333,8 +344,7 @@ class NativeTaskbarWidget:
                 self._apply()
                 return 0
             if msg == WM_APP_SHOW:
-                self._apply()
-                u32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+                self._apply()  # shows the window unless suppressed
                 return 0
             if msg == WM_APP_HIDE:
                 u32.ShowWindow(hwnd, SW_HIDE)
